@@ -2,7 +2,7 @@
 
 use core::hash::Hash;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,8 +40,8 @@ impl<T> Subject for T where T: Clone + Eq + Hash + Send + Sync + 'static {}
 ///
 /// Both methods are called from the gate's own tasks and must not block the async runtime. The
 /// gate applies [`PolicyGateConfig::unary_timeout`](crate::PolicyGateConfig::unary_timeout) to
-/// every lookup and reopens the watch with backoff, so an implementation needs no timeout or
-/// retry logic of its own. It does need to classify failures: the
+/// every admission or freshness lookup and reopens the watch with backoff, so an implementation
+/// needs no timeout or retry logic of its own. It does need to classify failures: the
 /// [`kind`](DecisionSourceError::kind) of a returned error decides whether the gate retries the
 /// call, fails admission, or counts a protocol violation.
 pub trait DecisionSource<T: Subject>: Send + Sync + 'static {
@@ -112,14 +112,30 @@ pub struct Permit {
     entry: TriompheArc<Entry>,
     changes: Receiver<EntryState>,
     observed: PermitState,
+    tracks_freshness: bool,
 }
 
 impl Clone for Permit {
     fn clone(&self) -> Self {
+        let entry = TriompheArc::clone(&self.entry);
+        let changes = entry.subscribe();
+        let observed = self.state();
+        if self.tracks_freshness {
+            Self::increment_live_count(&entry);
+        }
         Self {
-            entry: TriompheArc::clone(&self.entry),
-            changes: self.entry.subscribe(),
-            observed: self.state(),
+            entry,
+            changes,
+            observed,
+            tracks_freshness: self.tracks_freshness,
+        }
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if self.tracks_freshness {
+            Self::decrement_live_count(&self.entry);
         }
     }
 }
@@ -133,6 +149,39 @@ impl core::fmt::Debug for Permit {
 }
 
 impl Permit {
+    fn from_admission(entry: TriompheArc<Entry>) -> Option<Self> {
+        let changes = entry.subscribe();
+        let tracks_freshness = entry.freshness_signal.enabled();
+        if tracks_freshness {
+            Self::increment_live_count(&entry);
+        }
+        if !matches!(entry.state(), EntryState::Allowed) {
+            if tracks_freshness {
+                Self::decrement_live_count(&entry);
+            }
+            return None;
+        }
+        Some(Self {
+            entry,
+            changes,
+            observed: PermitState::Allowed,
+            tracks_freshness,
+        })
+    }
+
+    fn increment_live_count(entry: &Entry) {
+        if entry.live_permits.fetch_add(1, Ordering::AcqRel) == 0 {
+            entry.freshness_signal.schedule_entry(entry);
+        }
+    }
+
+    fn decrement_live_count(entry: &Entry) {
+        let prior = entry.live_permits.fetch_sub(1, Ordering::AcqRel);
+        assert!(prior > 0, "a permit decrements its live count exactly once");
+        // A scheduled refresh may now be unnecessary. The watcher will discover that at the
+        // already-scheduled refresh point, so dropping a permit never needs to wake it.
+    }
+
     /// Returns the current permit state using one atomic load.
     #[must_use]
     pub fn state(&self) -> PermitState {
@@ -385,6 +434,61 @@ impl<T: Copy> Observable<T> {
     }
 }
 
+struct FreshnessSignal {
+    refresh_ahead: Option<Duration>,
+    scheduled: Mutex<Option<Instant>>,
+    changes: Observable<()>,
+}
+
+impl FreshnessSignal {
+    fn new(refresh_ahead: Option<Duration>) -> Self {
+        Self {
+            refresh_ahead,
+            scheduled: Mutex::new(None),
+            changes: Observable::new(()),
+        }
+    }
+
+    fn schedule_entry(&self, entry: &Entry) {
+        let Some(refresh_ahead) = self.refresh_ahead else {
+            return;
+        };
+        if let Some(deadline) = entry.next_freshness_deadline(refresh_ahead) {
+            self.schedule(deadline);
+        }
+    }
+
+    fn schedule(&self, deadline: Instant) {
+        let mut scheduled = self.scheduled.lock();
+        if scheduled.is_some_and(|current| current <= deadline) {
+            return;
+        }
+        *scheduled = Some(deadline);
+        drop(scheduled);
+        self.changes.send(());
+    }
+
+    fn take_scheduled(&self) -> Option<Instant> {
+        self.scheduled.lock().take()
+    }
+
+    const fn enabled(&self) -> bool {
+        self.refresh_ahead.is_some()
+    }
+
+    fn subscribe(&self) -> Receiver<()> {
+        self.changes.subscribe()
+    }
+}
+
+#[derive(Debug)]
+struct FreshnessState {
+    generation: u64,
+    fresh_until: Option<Instant>,
+    refresh_attempted: bool,
+    refresh_in_flight: bool,
+}
+
 /// Shared subject state observed by admissions and active streams.
 // Streams poll state per frame; this prevents updates to neighboring subject entries from
 // causing false sharing on 64- or 128-byte cache lines.
@@ -395,6 +499,9 @@ pub(crate) struct Entry {
     last_touched: AtomicU64,
     fetch: Mutex<Option<PendingFetch>>,
     transitions: Observable<EntryState>,
+    live_permits: AtomicUsize,
+    freshness: Mutex<FreshnessState>,
+    freshness_signal: Arc<FreshnessSignal>,
 }
 
 impl core::fmt::Debug for Entry {
@@ -406,12 +513,20 @@ impl core::fmt::Debug for Entry {
 }
 
 impl Entry {
-    fn pending(fetch: PendingFetch) -> Self {
+    fn pending(fetch: PendingFetch, freshness_signal: Arc<FreshnessSignal>) -> Self {
         Self {
             state: AtomicU8::new(EntryState::Pending as u8),
             last_touched: AtomicU64::new(0),
             fetch: Mutex::new(Some(fetch)),
             transitions: Observable::new(EntryState::Pending),
+            live_permits: AtomicUsize::new(0),
+            freshness: Mutex::new(FreshnessState {
+                generation: 0,
+                fresh_until: None,
+                refresh_attempted: false,
+                refresh_in_flight: false,
+            }),
+            freshness_signal,
         }
     }
 
@@ -459,21 +574,126 @@ impl Entry {
     }
 
     fn admission(entry: TriompheArc<Self>) -> Option<Admission> {
-        let changes = entry.subscribe();
         match entry.state() {
-            EntryState::Allowed => Some(Admission::Allowed(Permit {
-                entry,
-                changes,
-                observed: PermitState::Allowed,
-            })),
+            EntryState::Allowed => Permit::from_admission(entry).map(Admission::Allowed),
             EntryState::Denied => Some(Admission::Denied),
             EntryState::Pending | EntryState::Stale => None,
         }
     }
 
     fn invalidate(&self) {
+        if !self.freshness_signal.enabled() {
+            self.store(EntryState::Stale);
+            *self.fetch.lock() = None;
+            return;
+        }
+        let mut freshness = self.freshness.lock();
         self.store(EntryState::Stale);
+        freshness.refresh_in_flight = false;
+        drop(freshness);
         *self.fetch.lock() = None;
+    }
+
+    fn compare_exchange_authoritative(
+        &self,
+        current: EntryState,
+        new: EntryState,
+        now: Instant,
+        ttl: Option<Duration>,
+        notify_scheduler: bool,
+    ) -> Result<(), EntryState> {
+        if ttl.is_none() {
+            return self.compare_exchange(current, new);
+        }
+        let mut freshness = self.freshness.lock();
+        self.compare_exchange(current, new)?;
+        freshness.generation = freshness.generation.wrapping_add(1);
+        freshness.fresh_until = ttl.map(|ttl| {
+            now.checked_add(ttl)
+                .expect("validated freshness TTL produces an Instant")
+        });
+        freshness.refresh_attempted = false;
+        freshness.refresh_in_flight = false;
+        drop(freshness);
+        if notify_scheduler {
+            self.freshness_signal.schedule_entry(self);
+        }
+        Ok(())
+    }
+
+    fn expire_if_due(&self, now: Instant) -> bool {
+        let mut freshness = self.freshness.lock();
+        let expired = freshness
+            .fresh_until
+            .is_some_and(|fresh_until| now >= fresh_until);
+        if !expired || !matches!(self.state(), EntryState::Allowed | EntryState::Denied) {
+            return false;
+        }
+        self.store(EntryState::Stale);
+        freshness.refresh_in_flight = false;
+        drop(freshness);
+        *self.fetch.lock() = None;
+        true
+    }
+
+    fn next_freshness_deadline(&self, refresh_ahead: Duration) -> Option<Instant> {
+        if !matches!(self.state(), EntryState::Allowed | EntryState::Denied) {
+            return None;
+        }
+        let freshness = self.freshness.lock();
+        let fresh_until = freshness.fresh_until?;
+        if self.live_permits.load(Ordering::Acquire) > 0 && !freshness.refresh_attempted {
+            return fresh_until.checked_sub(refresh_ahead);
+        }
+        Some(fresh_until)
+    }
+
+    fn begin_refresh_if_due(&self, now: Instant, refresh_ahead: Duration) -> Option<u64> {
+        if !matches!(self.state(), EntryState::Allowed | EntryState::Denied)
+            || self.live_permits.load(Ordering::Acquire) == 0
+        {
+            return None;
+        }
+        let mut freshness = self.freshness.lock();
+        let fresh_until = freshness.fresh_until?;
+        let refresh_at = fresh_until.checked_sub(refresh_ahead)?;
+        if now < refresh_at || now >= fresh_until || freshness.refresh_attempted {
+            return None;
+        }
+        freshness.refresh_attempted = true;
+        freshness.refresh_in_flight = true;
+        Some(freshness.generation)
+    }
+
+    fn apply_refresh_result(
+        &self,
+        generation: u64,
+        result: &Result<Verdict, DecisionSourceError>,
+        now: Instant,
+        ttl: Duration,
+    ) {
+        let mut freshness = self.freshness.lock();
+        if freshness.generation != generation || !freshness.refresh_in_flight {
+            return;
+        }
+        freshness.refresh_in_flight = false;
+        if freshness
+            .fresh_until
+            .is_some_and(|fresh_until| now >= fresh_until)
+        {
+            if matches!(self.state(), EntryState::Allowed | EntryState::Denied) {
+                self.store(EntryState::Stale);
+            }
+        } else if let Ok(verdict) = result {
+            freshness.generation = freshness.generation.wrapping_add(1);
+            freshness.fresh_until = Some(
+                now.checked_add(ttl)
+                    .expect("validated freshness TTL produces an Instant"),
+            );
+            freshness.refresh_attempted = false;
+            self.store((*verdict).into());
+        }
+        drop(freshness);
     }
 }
 
@@ -595,6 +815,29 @@ impl<T: Subject> SubjectMap<T> {
         }
     }
 
+    fn for_each_at(&self, now: Instant, mut visit: impl FnMut(&T, &TriompheArc<Entry>)) {
+        let mut entries = self.entries.lock();
+        self.evict(&mut entries, self.tick(now));
+        for (subject, slot) in entries.iter() {
+            visit(subject, &slot.entry);
+        }
+    }
+
+    fn apply_if_current<R>(
+        &self,
+        subject: &T,
+        entry: &TriompheArc<Entry>,
+        now: Instant,
+        apply: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let mut entries = self.entries.lock();
+        self.evict(&mut entries, self.tick(now));
+        entries
+            .peek(subject)
+            .is_some_and(|slot| TriompheArc::ptr_eq(&slot.entry, entry))
+            .then(apply)
+    }
+
     fn clear(&self) {
         let mut entries = self.entries.lock();
         for (_, slot) in entries.iter() {
@@ -636,6 +879,15 @@ struct PublishState {
     next_allowed: Instant,
 }
 
+pub(crate) struct DecisionRefresh<T: Subject> {
+    subject: T,
+    entry: TriompheArc<Entry>,
+    generation: u64,
+    result: Result<Verdict, DecisionSourceError>,
+}
+
+pub(crate) type DecisionRefreshFuture<T> = BoxFuture<'static, DecisionRefresh<T>>;
+
 /// Owns authoritative subject state and its cached read snapshot.
 pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> {
     client: Arc<C>,
@@ -648,6 +900,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
+    freshness_signal: Arc<FreshnessSignal>,
     config: PolicyGateConfig,
     stopping: AtomicBool,
     metrics: M,
@@ -668,6 +921,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     pub(crate) fn new(client: Arc<C>, config: &PolicyGateConfig, metrics: M, time: D) -> Arc<Self> {
         let now = time.now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
+        let freshness_signal = Arc::new(FreshnessSignal::new(config.decision_refresh_ahead()));
         Arc::new(Self {
             client,
             time,
@@ -685,6 +939,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 next_allowed: now,
             }),
             shape_dirty,
+            freshness_signal,
             config: *config,
             stopping: AtomicBool::new(false),
             metrics,
@@ -716,10 +971,25 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         self.time.clone()
     }
 
+    pub(crate) fn freshness_changes(&self) -> Receiver<()> {
+        self.freshness_signal.subscribe()
+    }
+
+    pub(crate) fn take_scheduled_freshness_deadline(&self) -> Option<Instant> {
+        self.freshness_signal.take_scheduled()
+    }
+
+    pub(crate) const fn freshness_enabled(&self) -> bool {
+        self.config.decision_freshness_ttl().is_some()
+    }
+
     /// Reads subject state through the snapshot and records its map recency.
     pub(crate) fn check(&self, subject: &T) -> Option<Admission> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
+        if self.freshness_enabled() {
+            entry.expire_if_due(self.time.now());
+        }
         // Pending and stale entries read as snapshot misses.
         entry.verdict()?;
         self.subjects.touch(subject, entry, self.time.now());
@@ -764,7 +1034,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 .subjects
                 .get_or_insert_with(subject.clone(), self.time.now(), || {
                     inserted = true;
-                    TriompheArc::new(Entry::pending(self.new_fetch_after(subject.clone(), None)))
+                    TriompheArc::new(Entry::pending(
+                        self.new_fetch_after(subject.clone(), None),
+                        Arc::clone(&self.freshness_signal),
+                    ))
                 });
             if inserted {
                 self.shape_dirty.store(true, Ordering::Release);
@@ -780,6 +1053,9 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 continue;
             }
 
+            if self.freshness_enabled() {
+                entry.expire_if_due(self.time.now());
+            }
             let pending = match entry.state() {
                 EntryState::Allowed | EntryState::Denied => {
                     self.metrics.map_hit();
@@ -951,7 +1227,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     ) -> bool {
         if let Ok(verdict) = result {
             // A watch event that wins this CAS supplies the verdict that stands.
-            match entry.compare_exchange(EntryState::Pending, (*verdict).into()) {
+            match entry.compare_exchange_authoritative(
+                EntryState::Pending,
+                (*verdict).into(),
+                self.time.now(),
+                self.config.decision_freshness_ttl(),
+                true,
+            ) {
                 Ok(()) => *entry.fetch.lock() = None,
                 Err(
                     EntryState::Pending
@@ -1006,6 +1288,114 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         None
     }
 
+    pub(crate) fn freshness_work(&self) -> (Vec<DecisionRefreshFuture<T>>, Option<Instant>) {
+        let (Some(_), Some(refresh_ahead)) = (
+            self.config.decision_freshness_ttl(),
+            self.config.decision_refresh_ahead(),
+        ) else {
+            return (Vec::new(), None);
+        };
+        let now = self.time.now();
+        let mut due = Vec::new();
+        let mut next = None;
+        self.subjects.for_each_at(now, |subject, entry| {
+            entry.expire_if_due(now);
+            if let Some(generation) = entry.begin_refresh_if_due(now, refresh_ahead) {
+                due.push((subject.clone(), TriompheArc::clone(entry), generation));
+            }
+            if let Some(deadline) = entry.next_freshness_deadline(refresh_ahead) {
+                next = Some(next.map_or(deadline, |current: Instant| current.min(deadline)));
+            }
+        });
+        self.republish_if_due();
+        (
+            due.into_iter()
+                .map(|(subject, entry, generation)| {
+                    self.new_decision_refresh(subject, entry, generation)
+                })
+                .collect(),
+            next,
+        )
+    }
+
+    pub(crate) fn apply_decision_refresh(&self, refresh: DecisionRefresh<T>) -> Option<Instant> {
+        let now = self.time.now();
+        let DecisionRefresh {
+            subject,
+            entry,
+            generation,
+            result,
+        } = refresh;
+        let next = self.subjects.apply_if_current(&subject, &entry, now, || {
+            entry.apply_refresh_result(
+                generation,
+                &result,
+                now,
+                self.config
+                    .decision_freshness_ttl()
+                    .expect("refreshes exist only when freshness is enabled"),
+            );
+            entry.next_freshness_deadline(
+                self.config
+                    .decision_refresh_ahead()
+                    .expect("refreshes exist only when freshness is enabled"),
+            )
+        });
+        self.republish_if_due();
+        next.flatten()
+    }
+
+    fn new_decision_refresh(
+        &self,
+        subject: T,
+        entry: TriompheArc<Entry>,
+        generation: u64,
+    ) -> DecisionRefreshFuture<T> {
+        let client = Arc::clone(&self.client);
+        let time = self.time.clone();
+        let metrics = self.metrics;
+        let unary_timeout = self.config.unary_timeout();
+        async move {
+            metrics.unary_call();
+            let result = async {
+                let decision = time
+                    .timeout(unary_timeout, client.get_subject_decision(&subject))
+                    .await
+                    .map_err(|_| {
+                        DecisionSourceError::new(
+                            DecisionSourceErrorKind::Transient,
+                            "subject decision refresh timed out",
+                        )
+                    })??;
+                match decision {
+                    Decision::Allowed => Ok(Verdict::Allowed),
+                    Decision::Denied => Ok(Verdict::Denied),
+                    Decision::Unspecified => Err(DecisionSourceError::new(
+                        DecisionSourceErrorKind::Transient,
+                        "decision source returned a non-authoritative decision",
+                    )),
+                }
+            }
+            .await;
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == DecisionSourceErrorKind::Wire)
+            {
+                metrics.wire_failure();
+            }
+            if result.is_err() {
+                metrics.unary_failure();
+            }
+            DecisionRefresh {
+                subject,
+                entry,
+                generation,
+                result,
+            }
+        }
+        .boxed()
+    }
+
     /// Marks the watch connected after clearing state from the prior connection.
     pub(crate) fn watch_connected(&self) {
         // Clear before publishing connected so no state from the old watch is served.
@@ -1031,7 +1421,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 
     /// Applies one watch change to a subject already known to this process.
-    pub(crate) fn apply_change(&self, change: &DecisionChange<T>) {
+    pub(crate) fn apply_change(&self, change: &DecisionChange<T>) -> Option<Instant> {
         let subject = &change.subject;
         // Absent subjects are ignored: a vanished entry is re-admitted by its stream or next request.
         if let Some(verdict) = decode_decision(change.decision) {
@@ -1044,7 +1434,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         EntryState::Stale => break,
                         current @ (EntryState::Pending
                         | EntryState::Allowed
-                        | EntryState::Denied) => match entry.compare_exchange(current, next) {
+                        | EntryState::Denied) => match entry.compare_exchange_authoritative(
+                            current,
+                            next,
+                            self.time.now(),
+                            self.config.decision_freshness_ttl(),
+                            false,
+                        ) {
                             Ok(()) => {
                                 *entry.fetch.lock() = None;
                                 break;
@@ -1058,6 +1454,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         },
                     }
                 }
+                return self
+                    .config
+                    .decision_refresh_ahead()
+                    .and_then(|refresh_ahead| entry.next_freshness_deadline(refresh_ahead));
             }
         } else {
             let removed = self.subjects.remove(subject, self.time.now());
@@ -1066,6 +1466,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             }
             self.republish_if_due();
         }
+        None
     }
 
     /// Rate-limited snapshot rebuild run by the slow-path operation that finds the dirty flag

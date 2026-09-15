@@ -265,6 +265,10 @@ impl ScriptedDecisionSource {
         self.get_calls.load(Ordering::Acquire)
     }
 
+    pub(crate) fn get_completions(&self) -> usize {
+        self.get_completions.load(Ordering::Acquire)
+    }
+
     pub(crate) fn watch_calls(&self) -> usize {
         self.watch_calls.load(Ordering::Acquire)
     }
@@ -281,7 +285,7 @@ impl ScriptedDecisionSource {
 
     pub(crate) async fn wait_for_get_completions(&self, expected: usize) {
         for _ in 0..WAIT_ITERATIONS {
-            if self.get_completions.load(Ordering::Acquire) >= expected {
+            if self.get_completions() >= expected {
                 return;
             }
             tokio::task::yield_now().await;
@@ -356,6 +360,8 @@ pub(crate) struct ConfigOptions {
     pub(crate) watch_events_per_yield: usize,
     pub(crate) max_subjects: usize,
     pub(crate) subject_ttl: Duration,
+    pub(crate) decision_freshness_ttl: Option<Duration>,
+    pub(crate) decision_refresh_ahead: Option<Duration>,
 }
 
 impl Default for ConfigOptions {
@@ -372,12 +378,14 @@ impl Default for ConfigOptions {
             watch_events_per_yield: 64,
             max_subjects: 65_536,
             subject_ttl: Duration::from_secs(3_600),
+            decision_freshness_ttl: None,
+            decision_refresh_ahead: None,
         }
     }
 }
 
 pub(crate) fn validated(options: &ConfigOptions) -> PolicyGateConfig {
-    PolicyGateConfig::builder()
+    let mut builder = PolicyGateConfig::builder()
         .unary_timeout(options.unary_timeout)
         .admission_timeout(options.admission_timeout)
         .initial_admission_retry_delay(options.initial_admission_retry_delay)
@@ -388,9 +396,14 @@ pub(crate) fn validated(options: &ConfigOptions) -> PolicyGateConfig {
         .max_reconnect_delay(options.max_reconnect_delay)
         .watch_events_per_yield(options.watch_events_per_yield)
         .max_subjects(options.max_subjects)
-        .subject_ttl(options.subject_ttl)
-        .build()
-        .expect("test config must validate")
+        .subject_ttl(options.subject_ttl);
+    if let Some(ttl) = options.decision_freshness_ttl {
+        builder = builder.decision_freshness_ttl(ttl);
+    }
+    if let Some(refresh_ahead) = options.decision_refresh_ahead {
+        builder = builder.decision_refresh_ahead(refresh_ahead);
+    }
+    builder.build().expect("test config must validate")
 }
 
 pub(crate) fn layer_config() -> PolicyGateLayerConfig {

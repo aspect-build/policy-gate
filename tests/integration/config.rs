@@ -47,6 +47,8 @@ fn builder_uses_public_defaults() {
     );
     assert_eq!(defaults.max_subjects(), DEFAULT_MAX_SUBJECTS);
     assert_eq!(defaults.subject_ttl(), DEFAULT_SUBJECT_TTL);
+    assert_eq!(defaults.decision_freshness_ttl(), None);
+    assert_eq!(defaults.decision_refresh_ahead(), None);
 }
 
 #[test]
@@ -142,4 +144,51 @@ fn maximum_subject_count_must_be_positive() {
         .expect_err("zero subject capacity must fail");
     assert_eq!(error, ConfigError::MaxSubjectsZero);
     assert!(error.to_string().contains("greater than zero"));
+}
+
+#[test]
+fn decision_freshness_requires_a_ttl_and_refresh_ahead() {
+    assert_config_error(
+        config().decision_freshness_ttl(Duration::from_secs(30)),
+        ConfigError::DecisionFreshnessIncomplete,
+    );
+    assert_config_error(
+        config().decision_refresh_ahead(Duration::from_secs(5)),
+        ConfigError::DecisionFreshnessIncomplete,
+    );
+}
+
+#[test]
+fn decision_refresh_ahead_must_be_less_than_freshness_ttl() {
+    for refresh_ahead in [Duration::from_secs(30), Duration::from_secs(31)] {
+        assert_config_error(
+            config()
+                .decision_freshness_ttl(Duration::from_secs(30))
+                .decision_refresh_ahead(refresh_ahead),
+            ConfigError::DecisionRefreshAheadNotLessThanTtl,
+        );
+    }
+    let configured = config()
+        .decision_freshness_ttl(Duration::from_secs(30))
+        .decision_refresh_ahead(Duration::from_secs(5))
+        .build()
+        .expect("complete freshness configuration validates");
+    assert_eq!(
+        configured.decision_freshness_ttl(),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        configured.decision_refresh_ahead(),
+        Some(Duration::from_secs(5))
+    );
+}
+
+#[test]
+fn decision_refresh_ahead_must_be_positive() {
+    assert_config_error(
+        config()
+            .decision_freshness_ttl(Duration::from_secs(30))
+            .decision_refresh_ahead(Duration::ZERO),
+        ConfigError::DecisionRefreshAheadZero,
+    );
 }
