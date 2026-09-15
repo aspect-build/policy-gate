@@ -8,12 +8,12 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use http_body::{Body, Frame, SizeHint};
 
-use crate::gate::{Admission, AdmissionState, DecisionSource, Subject};
+use crate::gate::{Admission, AdmissionState, DecisionSource, Observed, Subject};
 use crate::layer::{BodySide, BoxBodyError, GateContext, StreamRejection, StreamRejectionResponse};
 use crate::metrics::PolicyGateMetrics;
 use crate::time::TimeDriver;
 
-type Readmission = BoxFuture<'static, Result<Admission, crate::AdmissionUnavailable>>;
+type Readmission<D> = BoxFuture<'static, Result<Admission<D>, crate::AdmissionUnavailable>>;
 
 /// Body wrapper that cuts active streams when their subject becomes denied.
 #[pin_project::pin_project]
@@ -28,11 +28,11 @@ pub(crate) struct EnforcedBody<
     #[pin]
     inner: B,
     subject: T,
-    admission: Admission,
+    admission: Admission<D>,
     context: Arc<GateContext<T, C, M, D>>,
     response: R,
     // Polled once per frame so policy recovery does not stall the stream.
-    readmission: Option<Readmission>,
+    readmission: Option<Readmission<D>>,
     side: BodySide,
     ended: bool,
 }
@@ -50,7 +50,7 @@ impl<
     pub(crate) fn new(
         inner: B,
         subject: T,
-        admission: Admission,
+        admission: Admission<D>,
         context: Arc<GateContext<T, C, M, D>>,
         response: R,
         side: BodySide,
@@ -92,12 +92,12 @@ where
 
         loop {
             // Recheck on every body poll. No change observer wakes an idle connection.
-            match this.admission.state() {
-                AdmissionState::Allowed => {
+            match this.admission.observe() {
+                Observed::Allowed => {
                     return poll_inner_terminal(this.inner.as_mut(), cx, this.ended);
                 }
-                AdmissionState::Denied => break,
-                AdmissionState::Stale => {
+                Observed::Denied | Observed::Expired => break,
+                Observed::Stale => {
                     if let Some(admission) = this.context.gate.try_cached(this.subject) {
                         *this.readmission = None;
                         if admission.is_allowed() {

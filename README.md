@@ -60,3 +60,31 @@ Admission handles expose only synchronous `state()` and `is_allowed()` checks. A
 never wake an otherwise idle connection: denial is enforced on its next body poll, and ordinary
 stale state starts readmission then. `PolicyGate::admit()` is the async coordination point and
 concurrent calls for the same subject join one in-flight authority lookup.
+
+## Decision freshness
+
+`subject_ttl` remains a sliding idle-cache eviction policy. Absolute decision freshness is a
+separate opt-in safeguard configured with a finite freshness TTL.
+
+```rust
+# use core::time::Duration;
+# use policy_gate::PolicyGateConfig;
+let config = PolicyGateConfig::builder()
+    .decision_freshness_ttl(Duration::from_secs(60))
+    .build()?;
+# Ok::<(), policy_gate::ConfigError>(())
+```
+
+Admission handles carry the gate's concrete time driver as `Admission<D>` (defaulting to
+`TokioTimeDriver`). Clock calls are statically dispatched; entries store no driver or clock callback.
+
+The freshness deadline starts when a lookup completes or an authoritative watch change arrives;
+ordinary cache access does not extend it. `Admission::is_allowed()` returns false for denied,
+stale, or expired decisions; `state()` reports expiration as `Stale`. Admission refetches an expired
+cached decision. Request and response stream bodies cut off on their next poll after expiration,
+before delivering more traffic. An entirely idle stream stays idle: there is no expiration timer,
+background scan, or authority-change observer. A new watch decision installs a new absolute deadline;
+watch disconnects and eviction retain their existing stale/readmission recovery behavior. The default
+`DEFAULT_DECISION_FRESHNESS_TTL` is exactly `Duration::MAX`, a never-expire sentinel that is not
+converted into an `Instant`. This keeps freshness disabled by default,
+so existing users retain the original request and unary-call behavior.

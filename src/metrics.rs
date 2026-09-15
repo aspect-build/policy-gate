@@ -20,7 +20,7 @@ pub trait PolicyGateMetrics: Copy + Send + Sync + 'static {
     fn snapshot_miss(self) {}
     /// Records an admission served from the subject-state map rather than the published snapshot.
     fn map_hit(self) {}
-    /// Records an active stream terminated by a denial. Middleware event.
+    /// Records an active stream terminated by a denial or an expired decision. Middleware event.
     fn stream_cutoff(self) {}
     /// Records publication of a subject-map snapshot.
     fn snapshot_republish(self) {}
