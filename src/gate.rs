@@ -385,6 +385,53 @@ impl<T: Copy> Observable<T> {
     }
 }
 
+struct FreshnessSignal {
+    enabled: bool,
+    scheduled: Mutex<Option<Instant>>,
+    changes: Observable<()>,
+}
+
+impl FreshnessSignal {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            scheduled: Mutex::new(None),
+            changes: Observable::new(()),
+        }
+    }
+
+    fn schedule_entry(&self, entry: &Entry) {
+        if let Some(deadline) = entry.next_freshness_deadline() {
+            self.schedule(deadline);
+        }
+    }
+
+    fn schedule(&self, deadline: Instant) {
+        if !self.enabled {
+            return;
+        }
+        let mut scheduled = self.scheduled.lock();
+        if scheduled.is_some_and(|current| current <= deadline) {
+            return;
+        }
+        *scheduled = Some(deadline);
+        drop(scheduled);
+        self.changes.send(());
+    }
+
+    fn take_scheduled(&self) -> Option<Instant> {
+        self.scheduled.lock().take()
+    }
+
+    const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn subscribe(&self) -> Receiver<()> {
+        self.changes.subscribe()
+    }
+}
+
 /// Shared subject state observed by admissions and active streams.
 // Streams poll state per frame; this prevents updates to neighboring subject entries from
 // causing false sharing on 64- or 128-byte cache lines.
@@ -395,6 +442,8 @@ pub(crate) struct Entry {
     last_touched: AtomicU64,
     fetch: Mutex<Option<PendingFetch>>,
     transitions: Observable<EntryState>,
+    fresh_until: Mutex<Option<Instant>>,
+    freshness_signal: Arc<FreshnessSignal>,
 }
 
 impl core::fmt::Debug for Entry {
@@ -406,12 +455,14 @@ impl core::fmt::Debug for Entry {
 }
 
 impl Entry {
-    fn pending(fetch: PendingFetch) -> Self {
+    fn pending(fetch: PendingFetch, freshness_signal: Arc<FreshnessSignal>) -> Self {
         Self {
             state: AtomicU8::new(EntryState::Pending as u8),
             last_touched: AtomicU64::new(0),
             fetch: Mutex::new(Some(fetch)),
             transitions: Observable::new(EntryState::Pending),
+            fresh_until: Mutex::new(None),
+            freshness_signal,
         }
     }
 
@@ -459,21 +510,75 @@ impl Entry {
     }
 
     fn admission(entry: TriompheArc<Self>) -> Option<Admission> {
-        let changes = entry.subscribe();
         match entry.state() {
-            EntryState::Allowed => Some(Admission::Allowed(Permit {
-                entry,
-                changes,
-                observed: PermitState::Allowed,
-            })),
+            EntryState::Allowed => {
+                let changes = entry.subscribe();
+                Some(Admission::Allowed(Permit {
+                    entry,
+                    changes,
+                    observed: PermitState::Allowed,
+                }))
+            }
             EntryState::Denied => Some(Admission::Denied),
             EntryState::Pending | EntryState::Stale => None,
         }
     }
 
     fn invalidate(&self) {
+        if !self.freshness_signal.enabled() {
+            self.store(EntryState::Stale);
+            *self.fetch.lock() = None;
+            return;
+        }
+        let mut fresh_until = self.fresh_until.lock();
         self.store(EntryState::Stale);
+        *fresh_until = None;
+        drop(fresh_until);
         *self.fetch.lock() = None;
+    }
+
+    fn compare_exchange_authoritative(
+        &self,
+        current: EntryState,
+        new: EntryState,
+        now: Instant,
+        ttl: Option<Duration>,
+        notify_scheduler: bool,
+    ) -> Result<(), EntryState> {
+        if ttl.is_none() {
+            return self.compare_exchange(current, new);
+        }
+        let mut fresh_until = self.fresh_until.lock();
+        self.compare_exchange(current, new)?;
+        *fresh_until = ttl.map(|ttl| {
+            now.checked_add(ttl)
+                .expect("validated freshness TTL produces an Instant")
+        });
+        drop(fresh_until);
+        if notify_scheduler {
+            self.freshness_signal.schedule_entry(self);
+        }
+        Ok(())
+    }
+
+    fn expire_if_due(&self, now: Instant) -> bool {
+        let mut fresh_until = self.fresh_until.lock();
+        let expired = fresh_until.is_some_and(|deadline| now >= deadline);
+        if !expired || !matches!(self.state(), EntryState::Allowed | EntryState::Denied) {
+            return false;
+        }
+        self.store(EntryState::Stale);
+        *fresh_until = None;
+        drop(fresh_until);
+        *self.fetch.lock() = None;
+        true
+    }
+
+    fn next_freshness_deadline(&self) -> Option<Instant> {
+        if !matches!(self.state(), EntryState::Allowed | EntryState::Denied) {
+            return None;
+        }
+        *self.fresh_until.lock()
     }
 }
 
@@ -595,6 +700,14 @@ impl<T: Subject> SubjectMap<T> {
         }
     }
 
+    fn for_each_at(&self, now: Instant, mut visit: impl FnMut(&T, &TriompheArc<Entry>)) {
+        let mut entries = self.entries.lock();
+        self.evict(&mut entries, self.tick(now));
+        for (subject, slot) in entries.iter() {
+            visit(subject, &slot.entry);
+        }
+    }
+
     fn clear(&self) {
         let mut entries = self.entries.lock();
         for (_, slot) in entries.iter() {
@@ -648,6 +761,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
+    freshness_signal: Arc<FreshnessSignal>,
     config: PolicyGateConfig,
     stopping: AtomicBool,
     metrics: M,
@@ -668,6 +782,9 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     pub(crate) fn new(client: Arc<C>, config: &PolicyGateConfig, metrics: M, time: D) -> Arc<Self> {
         let now = time.now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
+        let freshness_signal = Arc::new(FreshnessSignal::new(
+            config.decision_freshness_ttl().is_some(),
+        ));
         Arc::new(Self {
             client,
             time,
@@ -685,6 +802,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 next_allowed: now,
             }),
             shape_dirty,
+            freshness_signal,
             config: *config,
             stopping: AtomicBool::new(false),
             metrics,
@@ -716,10 +834,25 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         self.time.clone()
     }
 
+    pub(crate) fn freshness_changes(&self) -> Receiver<()> {
+        self.freshness_signal.subscribe()
+    }
+
+    pub(crate) fn take_scheduled_freshness_deadline(&self) -> Option<Instant> {
+        self.freshness_signal.take_scheduled()
+    }
+
+    pub(crate) const fn freshness_enabled(&self) -> bool {
+        self.config.decision_freshness_ttl().is_some()
+    }
+
     /// Reads subject state through the snapshot and records its map recency.
     pub(crate) fn check(&self, subject: &T) -> Option<Admission> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
+        if self.freshness_enabled() {
+            entry.expire_if_due(self.time.now());
+        }
         // Pending and stale entries read as snapshot misses.
         entry.verdict()?;
         self.subjects.touch(subject, entry, self.time.now());
@@ -764,7 +897,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 .subjects
                 .get_or_insert_with(subject.clone(), self.time.now(), || {
                     inserted = true;
-                    TriompheArc::new(Entry::pending(self.new_fetch_after(subject.clone(), None)))
+                    TriompheArc::new(Entry::pending(
+                        self.new_fetch_after(subject.clone(), None),
+                        Arc::clone(&self.freshness_signal),
+                    ))
                 });
             if inserted {
                 self.shape_dirty.store(true, Ordering::Release);
@@ -780,6 +916,9 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 continue;
             }
 
+            if self.freshness_enabled() {
+                entry.expire_if_due(self.time.now());
+            }
             let pending = match entry.state() {
                 EntryState::Allowed | EntryState::Denied => {
                     self.metrics.map_hit();
@@ -951,7 +1090,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     ) -> bool {
         if let Ok(verdict) = result {
             // A watch event that wins this CAS supplies the verdict that stands.
-            match entry.compare_exchange(EntryState::Pending, (*verdict).into()) {
+            match entry.compare_exchange_authoritative(
+                EntryState::Pending,
+                (*verdict).into(),
+                self.time.now(),
+                self.config.decision_freshness_ttl(),
+                true,
+            ) {
                 Ok(()) => *entry.fetch.lock() = None,
                 Err(
                     EntryState::Pending
@@ -1006,6 +1151,22 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         None
     }
 
+    pub(crate) fn freshness_work(&self) -> Option<Instant> {
+        if !self.freshness_enabled() {
+            return None;
+        }
+        let now = self.time.now();
+        let mut next = None;
+        self.subjects.for_each_at(now, |_, entry| {
+            entry.expire_if_due(now);
+            if let Some(deadline) = entry.next_freshness_deadline() {
+                next = Some(next.map_or(deadline, |current: Instant| current.min(deadline)));
+            }
+        });
+        self.republish_if_due();
+        next
+    }
+
     /// Marks the watch connected after clearing state from the prior connection.
     pub(crate) fn watch_connected(&self) {
         // Clear before publishing connected so no state from the old watch is served.
@@ -1031,7 +1192,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 
     /// Applies one watch change to a subject already known to this process.
-    pub(crate) fn apply_change(&self, change: &DecisionChange<T>) {
+    pub(crate) fn apply_change(&self, change: &DecisionChange<T>) -> Option<Instant> {
         let subject = &change.subject;
         // Absent subjects are ignored: a vanished entry is re-admitted by its stream or next request.
         if let Some(verdict) = decode_decision(change.decision) {
@@ -1044,7 +1205,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         EntryState::Stale => break,
                         current @ (EntryState::Pending
                         | EntryState::Allowed
-                        | EntryState::Denied) => match entry.compare_exchange(current, next) {
+                        | EntryState::Denied) => match entry.compare_exchange_authoritative(
+                            current,
+                            next,
+                            self.time.now(),
+                            self.config.decision_freshness_ttl(),
+                            false,
+                        ) {
                             Ok(()) => {
                                 *entry.fetch.lock() = None;
                                 break;
@@ -1058,6 +1225,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         },
                     }
                 }
+                return entry.next_freshness_deadline();
             }
         } else {
             let removed = self.subjects.remove(subject, self.time.now());
@@ -1066,6 +1234,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             }
             self.republish_if_due();
         }
+        None
     }
 
     /// Rate-limited snapshot rebuild run by the slow-path operation that finds the dirty flag

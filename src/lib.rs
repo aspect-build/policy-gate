@@ -22,6 +22,10 @@
 //! [`AdmissionUnavailable`] once [`PolicyGateConfig::admission_timeout`] elapses. Dropping the
 //! watcher stops new admissions permanently and leaves every permit stale.
 //!
+//! Absolute decision freshness is opt-in. When configured, ordinary cache access never extends a
+//! decision's deadline, and the watcher marks the decision stale at expiry.
+//! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
+//!
 //! # Example
 //!
 //! ```
@@ -321,6 +325,7 @@ pub struct PolicyGateConfig {
     watch_events_per_yield: usize,
     max_subjects: usize,
     subject_ttl: Duration,
+    decision_freshness_ttl: Option<Duration>,
 }
 
 impl PolicyGateConfig {
@@ -339,6 +344,7 @@ impl PolicyGateConfig {
             watch_events_per_yield: DEFAULT_WATCH_EVENTS_PER_YIELD,
             max_subjects: DEFAULT_MAX_SUBJECTS,
             subject_ttl: DEFAULT_SUBJECT_TTL,
+            decision_freshness_ttl: None,
         }
     }
 
@@ -422,6 +428,15 @@ impl PolicyGateConfig {
     pub const fn subject_ttl(&self) -> Duration {
         self.subject_ttl
     }
+
+    /// Absolute age after which an authoritative decision is no longer usable.
+    ///
+    /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
+    /// `None` disables decision freshness checks and preserves the original cache behavior.
+    #[must_use]
+    pub const fn decision_freshness_ttl(&self) -> Option<Duration> {
+        self.decision_freshness_ttl
+    }
 }
 
 /// Builds one validated gate configuration.
@@ -441,6 +456,7 @@ pub struct PolicyGateConfigBuilder {
     watch_events_per_yield: usize,
     max_subjects: usize,
     subject_ttl: Duration,
+    decision_freshness_ttl: Option<Duration>,
 }
 
 impl PolicyGateConfigBuilder {
@@ -528,6 +544,15 @@ impl PolicyGateConfigBuilder {
         self
     }
 
+    /// Enables absolute decision freshness with the supplied TTL.
+    ///
+    /// Decision freshness is disabled when this setter is not used.
+    #[must_use]
+    pub const fn decision_freshness_ttl(mut self, ttl: Duration) -> Self {
+        self.decision_freshness_ttl = Some(ttl);
+        self
+    }
+
     /// Normalizes fields and checks cross-field rules.
     ///
     /// # Errors
@@ -584,6 +609,15 @@ impl PolicyGateConfigBuilder {
         if self.max_subjects == 0 {
             return Err(ConfigError::MaxSubjectsZero);
         }
+        if self.decision_freshness_ttl.is_some_and(|ttl| ttl.is_zero()) {
+            return Err(ConfigError::DecisionFreshnessTtlZero);
+        }
+        if self
+            .decision_freshness_ttl
+            .is_some_and(|ttl| now.checked_add(ttl).is_none())
+        {
+            return Err(ConfigError::DurationOverflow("decision freshness TTL"));
+        }
         Ok(PolicyGateConfig {
             unary_timeout: self.unary_timeout,
             admission_timeout: self.admission_timeout,
@@ -596,6 +630,7 @@ impl PolicyGateConfigBuilder {
             watch_events_per_yield: self.watch_events_per_yield,
             max_subjects: self.max_subjects,
             subject_ttl: self.subject_ttl,
+            decision_freshness_ttl: self.decision_freshness_ttl,
         })
     }
 }
@@ -621,6 +656,8 @@ pub enum ConfigError {
     DurationOverflow(&'static str),
     /// The subject-map capacity is zero, so no subject could ever be cached.
     MaxSubjectsZero,
+    /// A zero freshness TTL would make every authoritative decision immediately unusable.
+    DecisionFreshnessTtlZero,
 }
 
 impl fmt::Display for ConfigError {
@@ -651,6 +688,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "{name} is too large to represent as an Instant deadline")
             }
             Self::MaxSubjectsZero => f.write_str("maximum subject count must be greater than zero"),
+            Self::DecisionFreshnessTtlZero => {
+                f.write_str("decision freshness TTL must be greater than zero")
+            }
         }
     }
 }

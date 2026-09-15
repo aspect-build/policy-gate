@@ -71,7 +71,8 @@ impl<D: TimeDriver> DecisionSourceHealth<D> {
 ///
 /// The watcher is a future that never completes: it keeps the decision source's change stream
 /// open, applies each change to the gate's cache, and reopens the stream with jittered backoff
-/// after any failure. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
+/// after any failure. When decision freshness is enabled, it also expires decisions using the same
+/// time driver. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
 ///
 /// It is the gate's only writer, so its progress is a hard requirement rather than an
 /// optimization:
@@ -169,40 +170,29 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         match opened {
             Ok(Ok(stream)) => {
                 state.watch_connected();
-                let stream = stream.fuse();
-                let stable_timer = time.sleep(max_reconnect_delay).fuse();
-                futures_util::pin_mut!(stream, stable_timer);
-                let mut events_since_yield = 0;
-                loop {
-                    let item = futures_util::select! {
-                        () = stable_timer => {
-                            // Health recovery and backoff reset share the same stability threshold.
-                            reconnect_delay = initial_reconnect_delay;
-                            state.watch_stable();
-                            continue;
-                        },
-                        item = stream.next() => item,
-                    };
-                    let Some(item) = item else {
-                        break;
-                    };
-                    let change = match item {
-                        Ok(change) => change,
-                        Err(error) => {
-                            if error.kind() == DecisionSourceErrorKind::Wire {
-                                metrics.wire_failure();
-                            }
-                            tracing::warn!(?error, "policy authority watch failed");
-                            break;
-                        }
-                    };
-                    state.apply_change(&change);
-                    metrics.watch_event();
-                    events_since_yield += 1;
-                    if events_since_yield == watch_events_per_yield {
-                        events_since_yield = 0;
-                        time.yield_now().await;
-                    }
+                let stable = if state.freshness_enabled() {
+                    watch_connected_with_freshness(
+                        Arc::clone(&state),
+                        stream,
+                        metrics,
+                        time.clone(),
+                        max_reconnect_delay,
+                        watch_events_per_yield,
+                    )
+                    .await
+                } else {
+                    watch_connected_without_freshness(
+                        Arc::clone(&state),
+                        stream,
+                        metrics,
+                        time.clone(),
+                        max_reconnect_delay,
+                        watch_events_per_yield,
+                    )
+                    .await
+                };
+                if stable {
+                    reconnect_delay = initial_reconnect_delay;
                 }
                 metrics.watch_disconnect();
             }
@@ -222,6 +212,131 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         state.watch_disconnected();
         time.sleep(jitter(reconnect_delay)).await;
         reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+    }
+}
+
+async fn watch_connected_without_freshness<
+    T: Subject,
+    C: DecisionSource<T>,
+    M: PolicyGateMetrics,
+    D: TimeDriver,
+>(
+    state: Arc<GateState<T, C, M, D>>,
+    stream: C::Changes,
+    metrics: M,
+    time: D,
+    stability_delay: Duration,
+    events_per_yield: usize,
+) -> bool {
+    let stream = stream.fuse();
+    let stable_timer = time.sleep(stability_delay).fuse();
+    futures_util::pin_mut!(stream, stable_timer);
+    let mut stable = false;
+    let mut events_since_yield = 0;
+    loop {
+        let item = futures_util::select! {
+            () = stable_timer => {
+                stable = true;
+                state.watch_stable();
+                continue;
+            },
+            item = stream.next() => item,
+        };
+        let Some(change) = decode_watch_item(item, metrics) else {
+            return stable;
+        };
+        state.apply_change(&change);
+        metrics.watch_event();
+        events_since_yield += 1;
+        if events_since_yield == events_per_yield {
+            events_since_yield = 0;
+            time.yield_now().await;
+        }
+    }
+}
+
+async fn watch_connected_with_freshness<
+    T: Subject,
+    C: DecisionSource<T>,
+    M: PolicyGateMetrics,
+    D: TimeDriver,
+>(
+    state: Arc<GateState<T, C, M, D>>,
+    stream: C::Changes,
+    metrics: M,
+    time: D,
+    stability_delay: Duration,
+    events_per_yield: usize,
+) -> bool {
+    let stream = stream.fuse();
+    let stable_timer = time.sleep(stability_delay).fuse();
+    let mut freshness_changes = state.freshness_changes();
+    let mut freshness_deadline = state.take_scheduled_freshness_deadline();
+    futures_util::pin_mut!(stream, stable_timer);
+    let mut stable = false;
+    let mut events_since_yield = 0;
+    loop {
+        let freshness_timer: BoxFuture<'_, ()> = if let Some(deadline) = freshness_deadline {
+            time.sleep_until(deadline).boxed()
+        } else {
+            core::future::pending().boxed()
+        };
+        let freshness_timer = freshness_timer.fuse();
+        let freshness_change = freshness_changes.changed().fuse();
+        futures_util::pin_mut!(freshness_timer, freshness_change);
+        let item = futures_util::select! {
+            () = stable_timer => {
+                stable = true;
+                state.watch_stable();
+                continue;
+            },
+            () = freshness_timer => {
+                freshness_deadline = state.freshness_work();
+                continue;
+            },
+            _ = freshness_change => {
+                freshness_deadline = earlier(
+                    freshness_deadline,
+                    state.take_scheduled_freshness_deadline(),
+                );
+                continue;
+            },
+            item = stream.next() => item,
+        };
+        let Some(change) = decode_watch_item(item, metrics) else {
+            return stable;
+        };
+        freshness_deadline = earlier(freshness_deadline, state.apply_change(&change));
+        metrics.watch_event();
+        events_since_yield += 1;
+        if events_since_yield == events_per_yield {
+            events_since_yield = 0;
+            time.yield_now().await;
+        }
+    }
+}
+
+fn decode_watch_item<T: Subject, M: PolicyGateMetrics>(
+    item: Option<Result<crate::DecisionChange<T>, crate::DecisionSourceError>>,
+    metrics: M,
+) -> Option<crate::DecisionChange<T>> {
+    match item? {
+        Ok(change) => Some(change),
+        Err(error) => {
+            if error.kind() == DecisionSourceErrorKind::Wire {
+                metrics.wire_failure();
+            }
+            tracing::warn!(?error, "policy authority watch failed");
+            None
+        }
+    }
+}
+
+fn earlier(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (Some(current), None) => Some(current),
+        (None, candidate) => candidate,
     }
 }
 

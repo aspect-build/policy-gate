@@ -47,6 +47,7 @@ fn builder_uses_public_defaults() {
     );
     assert_eq!(defaults.max_subjects(), DEFAULT_MAX_SUBJECTS);
     assert_eq!(defaults.subject_ttl(), DEFAULT_SUBJECT_TTL);
+    assert_eq!(defaults.decision_freshness_ttl(), None);
 }
 
 #[test]
@@ -142,4 +143,24 @@ fn maximum_subject_count_must_be_positive() {
         .expect_err("zero subject capacity must fail");
     assert_eq!(error, ConfigError::MaxSubjectsZero);
     assert!(error.to_string().contains("greater than zero"));
+}
+
+#[test]
+fn decision_freshness_ttl_is_independently_optional() {
+    let configured = config()
+        .decision_freshness_ttl(Duration::from_secs(30))
+        .build()
+        .expect("freshness TTL validates without another setting");
+    assert_eq!(
+        configured.decision_freshness_ttl(),
+        Some(Duration::from_secs(30))
+    );
+}
+
+#[test]
+fn decision_freshness_ttl_must_be_positive() {
+    assert_config_error(
+        config().decision_freshness_ttl(Duration::ZERO),
+        ConfigError::DecisionFreshnessTtlZero,
+    );
 }
