@@ -23,8 +23,9 @@
 //! watcher stops new admissions permanently and leaves every permit stale.
 //!
 //! Absolute decision freshness is opt-in. When configured, ordinary cache access never extends a
-//! decision's deadline, and the watcher marks the decision stale at expiry.
-//! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
+//! decision's deadline, and the watcher marks it stale at expiry. An optional refresh-ahead setting
+//! proactively refreshes subjects with live permits. [`PolicyGateConfig::subject_ttl`] remains the
+//! separate sliding idle-cache eviction policy.
 //!
 //! # Example
 //!
@@ -326,6 +327,7 @@ pub struct PolicyGateConfig {
     max_subjects: usize,
     subject_ttl: Duration,
     decision_freshness_ttl: Option<Duration>,
+    decision_refresh_ahead: Option<Duration>,
 }
 
 impl PolicyGateConfig {
@@ -345,6 +347,7 @@ impl PolicyGateConfig {
             max_subjects: DEFAULT_MAX_SUBJECTS,
             subject_ttl: DEFAULT_SUBJECT_TTL,
             decision_freshness_ttl: None,
+            decision_refresh_ahead: None,
         }
     }
 
@@ -437,6 +440,14 @@ impl PolicyGateConfig {
     pub const fn decision_freshness_ttl(&self) -> Option<Duration> {
         self.decision_freshness_ttl
     }
+
+    /// How long before freshness expiry a subject with a live permit is refreshed.
+    ///
+    /// `None` disables proactive refresh while allowing absolute expiry to remain enabled.
+    #[must_use]
+    pub const fn decision_refresh_ahead(&self) -> Option<Duration> {
+        self.decision_refresh_ahead
+    }
 }
 
 /// Builds one validated gate configuration.
@@ -457,6 +468,7 @@ pub struct PolicyGateConfigBuilder {
     max_subjects: usize,
     subject_ttl: Duration,
     decision_freshness_ttl: Option<Duration>,
+    decision_refresh_ahead: Option<Duration>,
 }
 
 impl PolicyGateConfigBuilder {
@@ -546,10 +558,21 @@ impl PolicyGateConfigBuilder {
 
     /// Enables absolute decision freshness with the supplied TTL.
     ///
-    /// Decision freshness is disabled when this setter is not used.
+    /// This setting is independently useful for absolute expiry. Pair it with
+    /// [`PolicyGateConfigBuilder::decision_refresh_ahead`] to proactively refresh live permits.
     #[must_use]
     pub const fn decision_freshness_ttl(mut self, ttl: Duration) -> Self {
         self.decision_freshness_ttl = Some(ttl);
+        self
+    }
+
+    /// Sets how long before decision freshness expiry a live permit triggers a refresh.
+    ///
+    /// This requires [`PolicyGateConfigBuilder::decision_freshness_ttl`] and must be strictly less
+    /// than that TTL.
+    #[must_use]
+    pub const fn decision_refresh_ahead(mut self, refresh_ahead: Duration) -> Self {
+        self.decision_refresh_ahead = Some(refresh_ahead);
         self
     }
 
@@ -618,6 +641,15 @@ impl PolicyGateConfigBuilder {
         {
             return Err(ConfigError::DurationOverflow("decision freshness TTL"));
         }
+        match (self.decision_freshness_ttl, self.decision_refresh_ahead) {
+            (None | Some(_), None) => {}
+            (Some(_), Some(refresh_ahead)) if refresh_ahead.is_zero() => {
+                return Err(ConfigError::DecisionRefreshAheadZero);
+            }
+            (Some(ttl), Some(refresh_ahead)) if refresh_ahead < ttl => {}
+            (Some(_), Some(_)) => return Err(ConfigError::DecisionRefreshAheadNotLessThanTtl),
+            (None, Some(_)) => return Err(ConfigError::DecisionFreshnessIncomplete),
+        }
         Ok(PolicyGateConfig {
             unary_timeout: self.unary_timeout,
             admission_timeout: self.admission_timeout,
@@ -631,6 +663,7 @@ impl PolicyGateConfigBuilder {
             max_subjects: self.max_subjects,
             subject_ttl: self.subject_ttl,
             decision_freshness_ttl: self.decision_freshness_ttl,
+            decision_refresh_ahead: self.decision_refresh_ahead,
         })
     }
 }
@@ -658,6 +691,12 @@ pub enum ConfigError {
     MaxSubjectsZero,
     /// A zero freshness TTL would make every authoritative decision immediately unusable.
     DecisionFreshnessTtlZero,
+    /// Decision refresh-ahead was configured without a freshness TTL.
+    DecisionFreshnessIncomplete,
+    /// A zero refresh-ahead would wait until the decision is already expired.
+    DecisionRefreshAheadZero,
+    /// Decision refresh-ahead must be strictly less than the freshness TTL.
+    DecisionRefreshAheadNotLessThanTtl,
 }
 
 impl fmt::Display for ConfigError {
@@ -690,6 +729,15 @@ impl fmt::Display for ConfigError {
             Self::MaxSubjectsZero => f.write_str("maximum subject count must be greater than zero"),
             Self::DecisionFreshnessTtlZero => {
                 f.write_str("decision freshness TTL must be greater than zero")
+            }
+            Self::DecisionFreshnessIncomplete => {
+                f.write_str("decision refresh-ahead requires a decision freshness TTL")
+            }
+            Self::DecisionRefreshAheadZero => {
+                f.write_str("decision refresh-ahead must be greater than zero")
+            }
+            Self::DecisionRefreshAheadNotLessThanTtl => {
+                f.write_str("decision refresh-ahead must be less than decision freshness TTL")
             }
         }
     }

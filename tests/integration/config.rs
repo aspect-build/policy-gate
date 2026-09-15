@@ -48,6 +48,7 @@ fn builder_uses_public_defaults() {
     assert_eq!(defaults.max_subjects(), DEFAULT_MAX_SUBJECTS);
     assert_eq!(defaults.subject_ttl(), DEFAULT_SUBJECT_TTL);
     assert_eq!(defaults.decision_freshness_ttl(), None);
+    assert_eq!(defaults.decision_refresh_ahead(), None);
 }
 
 #[test]
@@ -146,14 +147,23 @@ fn maximum_subject_count_must_be_positive() {
 }
 
 #[test]
-fn decision_freshness_ttl_is_independently_optional() {
+fn decision_freshness_ttl_remains_valid_without_refresh_ahead() {
     let configured = config()
         .decision_freshness_ttl(Duration::from_secs(30))
         .build()
-        .expect("freshness TTL validates without another setting");
+        .expect("freshness TTL independently enables absolute expiry");
     assert_eq!(
         configured.decision_freshness_ttl(),
         Some(Duration::from_secs(30))
+    );
+    assert_eq!(configured.decision_refresh_ahead(), None);
+}
+
+#[test]
+fn decision_refresh_ahead_requires_a_freshness_ttl() {
+    assert_config_error(
+        config().decision_refresh_ahead(Duration::from_secs(5)),
+        ConfigError::DecisionFreshnessIncomplete,
     );
 }
 
@@ -162,5 +172,40 @@ fn decision_freshness_ttl_must_be_positive() {
     assert_config_error(
         config().decision_freshness_ttl(Duration::ZERO),
         ConfigError::DecisionFreshnessTtlZero,
+    );
+}
+
+#[test]
+fn decision_refresh_ahead_must_be_less_than_freshness_ttl() {
+    for refresh_ahead in [Duration::from_secs(30), Duration::from_secs(31)] {
+        assert_config_error(
+            config()
+                .decision_freshness_ttl(Duration::from_secs(30))
+                .decision_refresh_ahead(refresh_ahead),
+            ConfigError::DecisionRefreshAheadNotLessThanTtl,
+        );
+    }
+    let configured = config()
+        .decision_freshness_ttl(Duration::from_secs(30))
+        .decision_refresh_ahead(Duration::from_secs(5))
+        .build()
+        .expect("complete freshness configuration validates");
+    assert_eq!(
+        configured.decision_freshness_ttl(),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        configured.decision_refresh_ahead(),
+        Some(Duration::from_secs(5))
+    );
+}
+
+#[test]
+fn decision_refresh_ahead_must_be_positive() {
+    assert_config_error(
+        config()
+            .decision_freshness_ttl(Duration::from_secs(30))
+            .decision_refresh_ahead(Duration::ZERO),
+        ConfigError::DecisionRefreshAheadZero,
     );
 }

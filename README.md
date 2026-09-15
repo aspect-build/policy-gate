@@ -61,7 +61,8 @@ attempted.
 ## Decision freshness
 
 `subject_ttl` remains a sliding idle-cache eviction policy. Absolute decision freshness is a
-separate opt-in safeguard configured with a freshness TTL.
+separate opt-in safeguard configured with a freshness TTL. A refresh-ahead interval shorter than
+that TTL can additionally refresh subjects with live permits before expiry.
 
 ```rust
 # use core::time::Duration;
@@ -73,6 +74,10 @@ let config = PolicyGateConfig::builder()
 ```
 
 The freshness deadline starts when a lookup completes or an authoritative watch change arrives;
-ordinary cache access does not extend it. At the absolute deadline, the cached decision and its
-permits become stale and the next admission must fetch a new decision. Freshness is disabled by
-default, so existing users keep the original request and unary-call behavior.
+ordinary cache access does not extend it. Without `decision_refresh_ahead`, the cached decision and
+its permits become stale at the absolute deadline. Setting `decision_refresh_ahead` makes the
+watcher issue one proactive lookup when a subject still has a live permit at that point. Subjects
+without live permits are not refreshed solely for freshness. If no refresh succeeds before the
+absolute deadline, the cached decision and its permits become stale and the next admission must
+fetch a new decision. Freshness is disabled by default, so existing users keep the original request
+and unary-call behavior.

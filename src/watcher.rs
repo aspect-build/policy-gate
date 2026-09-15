@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -71,8 +72,9 @@ impl<D: TimeDriver> DecisionSourceHealth<D> {
 ///
 /// The watcher is a future that never completes: it keeps the decision source's change stream
 /// open, applies each change to the gate's cache, and reopens the stream with jittered backoff
-/// after any failure. When decision freshness is enabled, it also expires decisions using the same
-/// time driver. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
+/// after any failure. When decision freshness is enabled, it also drives refresh-ahead lookups and
+/// freshness expiry using the same time driver. Poll it for the lifetime of the gate, normally
+/// with `tokio::spawn`.
 ///
 /// It is the gate's only writer, so its progress is a hard requirement rather than an
 /// optimization:
@@ -170,7 +172,17 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         match opened {
             Ok(Ok(stream)) => {
                 state.watch_connected();
-                let stable = if state.freshness_enabled() {
+                let stable = if state.refresh_enabled() {
+                    watch_connected_with_refresh(
+                        Arc::clone(&state),
+                        stream,
+                        metrics,
+                        time.clone(),
+                        max_reconnect_delay,
+                        watch_events_per_yield,
+                    )
+                    .await
+                } else if state.freshness_enabled() {
                     watch_connected_with_freshness(
                         Arc::clone(&state),
                         stream,
@@ -291,7 +303,7 @@ async fn watch_connected_with_freshness<
                 continue;
             },
             () = freshness_timer => {
-                freshness_deadline = state.freshness_work();
+                freshness_deadline = state.freshness_expiry_work();
                 continue;
             },
             _ = freshness_change => {
@@ -311,6 +323,83 @@ async fn watch_connected_with_freshness<
         events_since_yield += 1;
         if events_since_yield == events_per_yield {
             events_since_yield = 0;
+            time.yield_now().await;
+        }
+    }
+}
+
+async fn watch_connected_with_refresh<
+    T: Subject,
+    C: DecisionSource<T>,
+    M: PolicyGateMetrics,
+    D: TimeDriver,
+>(
+    state: Arc<GateState<T, C, M, D>>,
+    stream: C::Changes,
+    metrics: M,
+    time: D,
+    stability_delay: Duration,
+    work_per_yield: usize,
+) -> bool {
+    let stream = stream.fuse();
+    let stable_timer = time.sleep(stability_delay).fuse();
+    let mut freshness_changes = state.freshness_changes();
+    let mut freshness_deadline = state.take_scheduled_freshness_deadline();
+    let mut refreshes = FuturesUnordered::new();
+    futures_util::pin_mut!(stream, stable_timer);
+    let mut stable = false;
+    let mut work_since_yield = 0;
+    loop {
+        let freshness_timer: BoxFuture<'_, ()> = if let Some(deadline) = freshness_deadline {
+            time.sleep_until(deadline).boxed()
+        } else {
+            core::future::pending().boxed()
+        };
+        let freshness_timer = freshness_timer.fuse();
+        let freshness_change = freshness_changes.changed().fuse();
+        let refresh = refreshes.select_next_some();
+        futures_util::pin_mut!(freshness_timer, freshness_change, refresh);
+        let item = futures_util::select! {
+            () = stable_timer => {
+                stable = true;
+                state.watch_stable();
+                continue;
+            },
+            () = freshness_timer => {
+                let (due, next) = state.freshness_work();
+                refreshes.extend(due);
+                freshness_deadline = next;
+                continue;
+            },
+            _ = freshness_change => {
+                freshness_deadline = earlier(
+                    freshness_deadline,
+                    state.take_scheduled_freshness_deadline(),
+                );
+                continue;
+            },
+            refresh = refresh => {
+                freshness_deadline = earlier(
+                    freshness_deadline,
+                    state.apply_decision_refresh(refresh),
+                );
+                work_since_yield += 1;
+                if work_since_yield == work_per_yield {
+                    work_since_yield = 0;
+                    time.yield_now().await;
+                }
+                continue;
+            },
+            item = stream.next() => item,
+        };
+        let Some(change) = decode_watch_item(item, metrics) else {
+            return stable;
+        };
+        freshness_deadline = earlier(freshness_deadline, state.apply_change(&change));
+        metrics.watch_event();
+        work_since_yield += 1;
+        if work_since_yield == work_per_yield {
+            work_since_yield = 0;
             time.yield_now().await;
         }
     }
