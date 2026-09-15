@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - name: Check feature isolation
+        run: |
+          cargo check --no-default-features
+          cargo check --no-default-features --features tower-layer
+          cargo check --no-default-features --features axum-body
+          cargo check --no-default-features --features tonic-client
+          cargo check --no-default-features --features tonic-layer
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps

@@ -1,0 +1,129 @@
+// Copyright 2026 Aspect Build Systems, Inc. All rights reserved.
+
+syntax = "proto3";
+
+// Wire contract between a policy gate and the authority that owns its decisions.
+//
+// The authority is the only source of truth. A gate caches what the authority told it
+// and never infers a decision of its own.
+//
+// Every RPC names a scope: one opaque policy domain whose name clients and the
+// authority agree on out of band. A client binds to exactly one scope and sends that
+// same name on every request.
+package aspect.policy.gate.v1;
+
+// Serves the decision in force for each subject in a scope, and the later changes to it.
+//
+// Clients pair the two RPCs. The unary lookup answers whether one subject may start
+// work; the watch stream keeps work already admitted current. Both are read-only, so
+// retrying either is safe.
+service PolicyAuthority {
+  // Returns the decision in force for one subject.
+  //
+  // The authority MUST answer a subject it holds no decision for with
+  // DECISION_UNSPECIFIED rather than NOT_FOUND.
+  //
+  // Clients treat NOT_FOUND, INVALID_ARGUMENT, PERMISSION_DENIED, UNAUTHENTICATED,
+  // UNIMPLEMENTED, and DATA_LOSS as permanent and fail the admission; every other status
+  // is transient and retried under the client's own deadline.
+  rpc GetSubjectDecision(GetSubjectDecisionRequest)
+      returns (GetSubjectDecisionResponse);
+
+  // Streams decision changes for every subject in one scope.
+  //
+  // The stream carries changes only. The authority is not required to open it with a
+  // snapshot, because a client looks a subject up with GetSubjectDecision before
+  // admitting it.
+  //
+  // The authority MAY end the stream at any time; ending it is not an error. A client
+  // discards its cached decisions on disconnect, reconnects with jittered backoff, and
+  // fails a new admission closed once its admission deadline passes with the stream
+  // still down. An authority that cannot keep up with a client SHOULD therefore end its
+  // stream rather than delay or drop individual changes.
+  rpc WatchSubjectDecisions(WatchSubjectDecisionsRequest)
+      returns (stream SubjectDecisionChange);
+}
+
+// Whether a subject may work within a scope.
+//
+// A client rejects a value it does not know as a protocol failure, so adding a value
+// breaks deployed clients.
+enum Decision {
+  // The authority holds no decision for the subject.
+  //
+  // As a lookup result it is not authoritative and the client retries until its
+  // admission deadline. As a change it withdraws the subject's cached decision and
+  // invalidates work already admitted under it.
+  DECISION_UNSPECIFIED = 0;
+  // The subject may start new work and continue work already admitted.
+  DECISION_ALLOWED = 1;
+  // The subject may not start new work, and work already admitted MUST stop.
+  DECISION_DENIED = 2;
+
+  // NextId: 3
+}
+
+// Looks one subject up in one scope.
+message GetSubjectDecisionRequest {
+  // Subject the decision is asked about.
+  //
+  // Required. The identifier is opaque to the wire: the client sends the exact string it
+  // gates on, and the authority MUST match it byte for byte rather than normalizing it.
+  string subject_id = 1;
+  // Scope the lookup applies to.
+  //
+  // Required. It is the scope the client is bound to, and is the same on every request
+  // that client sends.
+  string scope = 2;
+
+  // NextId: 3
+}
+
+// The requested subject's decision.
+message GetSubjectDecisionResponse {
+  // Decision in force for the requested subject.
+  Decision decision = 1;
+  // Scope the decision was evaluated in.
+  //
+  // The authority MUST echo the request's scope. A client rejects a non-empty mismatch
+  // as a protocol failure, which keeps a misrouted or misconfigured authority from
+  // supplying verdicts for another scope. An empty echo is rejected the same way unless
+  // the client is configured to tolerate it while an authority that does not yet echo
+  // rolls out.
+  string scope = 2;
+
+  // NextId: 3
+}
+
+// Opens one scope's change stream.
+message WatchSubjectDecisionsRequest {
+  // Scope to watch.
+  //
+  // Required. One stream carries one scope; a client that gates several scopes opens a
+  // stream per scope.
+  string scope = 1;
+
+  // NextId: 2
+}
+
+// One subject's decision change within the watched scope.
+message SubjectDecisionChange {
+  // Subject the change applies to.
+  //
+  // Required, and carried in the same form as GetSubjectDecisionRequest.subject_id. A
+  // client ignores a change for a subject it is not currently tracking, so the authority
+  // MAY send changes for the whole scope.
+  string subject_id = 1;
+  // Decision now in force for the subject.
+  //
+  // DECISION_UNSPECIFIED means the subject no longer has an authoritative decision.
+  Decision decision = 2;
+  // Scope the change was evaluated in.
+  //
+  // The authority MUST echo the watch request's scope, under the same rules as
+  // GetSubjectDecisionResponse.scope. A client that rejects a change ends the stream and
+  // reconnects.
+  string scope = 3;
+
+  // NextId: 4
+}
