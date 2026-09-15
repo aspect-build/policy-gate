@@ -11,16 +11,16 @@ use futures_core::Stream;
 use futures_util::task::noop_waker;
 use policy_gate::{
     Decision, DecisionChange, DecisionSource, DecisionSourceError, DecisionSourceErrorKind,
-    DecisionSourceHealthStatus, PolicyGate, PolicyGateRuntime,
+    DecisionSourceHealthStatus, NoopPolicyGateMetrics, PolicyGate,
 };
 use tokio::sync::broadcast;
 use tonic::Code;
 use uuid::Uuid;
 
 use crate::support::{
-    ConfigOptions, GetAction, SUBJECT_A, ScriptedDecisionSource, assert_allowed, assert_rejected,
-    call_subject, response, runtime, start_runtime, validated, wait_for_health, wait_for_metric,
-    wait_for_watch_connected,
+    ConfigOptions, GetAction, SUBJECT_A, ScriptedDecisionSource, TestRuntime, TestTimeDriver,
+    assert_allowed, assert_rejected, call_subject, runtime, start_runtime, validated,
+    wait_for_health, wait_for_metric, wait_for_watch_connected,
 };
 
 struct AlwaysReadysource {
@@ -74,7 +74,12 @@ async fn always_ready_watch_stream_yields_to_its_caller() {
         watch_events_per_yield: 3,
         ..ConfigOptions::default()
     };
-    let (_gate, watcher, _health) = PolicyGate::new(&validated(&options), Arc::clone(&source));
+    let (_gate, watcher, _health) = PolicyGate::new_with_metrics_and_time_driver(
+        &validated(&options),
+        Arc::clone(&source),
+        NoopPolicyGateMetrics,
+        TestTimeDriver::default(),
+    );
     let mut watcher = Box::pin(watcher);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -83,22 +88,20 @@ async fn always_ready_watch_stream_yields_to_its_caller() {
     assert_eq!(events.load(Ordering::Relaxed), 3);
 }
 
-#[tokio::test(start_paused = true)]
-async fn disconnect_and_reconnect_both_clear_the_map() {
+#[tokio::test]
+async fn disconnect_forces_refetch_after_reconnect() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let first_watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     source
-        .push_get(SUBJECT_A, GetAction::Return(Ok(response(Decision::Denied))))
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Denied)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
     assert_allowed(&call_subject(&runtime.layer, SUBJECT_A).await);
     assert_eq!(source.get_calls(), 1);
+    let republishes = runtime.metrics.snapshot_republishes.load(Ordering::Relaxed);
 
     let _second_watch = source.push_live_watch(Vec::new()).await;
     drop(first_watch);
@@ -111,9 +114,14 @@ async fn disconnect_and_reconnect_both_clear_the_map() {
     wait_for_metric(&runtime.metrics.snapshot_misses, misses + 1).await;
     assert_eq!(source.get_calls(), 1);
 
-    tokio::time::advance(Duration::from_millis(50)).await;
+    runtime.time.advance(Duration::from_millis(10)).await;
+    assert_eq!(
+        runtime.metrics.snapshot_republishes.load(Ordering::Relaxed),
+        republishes
+    );
+    runtime.time.advance(Duration::from_millis(40)).await;
     assert_eq!(source.watch_calls(), 1);
-    tokio::time::advance(Duration::from_millis(75)).await;
+    runtime.time.advance(Duration::from_millis(75)).await;
     source.wait_for_watches(2).await;
     wait_for_watch_connected(&runtime.metrics, true).await;
     assert_rejected(&call.await.expect("call joins"), Code::FailedPrecondition);
@@ -121,14 +129,15 @@ async fn disconnect_and_reconnect_both_clear_the_map() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn watch_open_is_abandoned_at_the_admission_deadline() {
     let source = Arc::new(ScriptedDecisionSource::default());
     source.push_pending_watch().await;
-    let PolicyGateRuntime {
+    let TestRuntime {
         watcher,
         health,
         metrics,
+        time,
         ..
     } = runtime(
         Arc::clone(&source),
@@ -149,7 +158,7 @@ async fn watch_open_is_abandoned_at_the_admission_deadline() {
     });
     source.wait_for_watches(1).await;
 
-    tokio::time::advance(Duration::from_secs(1)).await;
+    time.advance(Duration::from_secs(1)).await;
     wait_for_metric(&metrics.watch_open_failures, 1).await;
     wait_for_health(&health, false).await;
     assert_eq!(metrics.watch_disconnects.load(Ordering::Relaxed), 0);
@@ -158,19 +167,16 @@ async fn watch_open_is_abandoned_at_the_admission_deadline() {
     task.await.expect("watch task joins");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn wire_failure_reconnects_and_clears_state() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let watch = source.push_live_watch(Vec::new()).await;
     let _second_watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     source
-        .push_get(SUBJECT_A, GetAction::Return(Ok(response(Decision::Denied))))
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Denied)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
     assert_allowed(&call_subject(&runtime.layer, SUBJECT_A).await);
@@ -185,7 +191,7 @@ async fn wire_failure_reconnects_and_clears_state() {
     wait_for_metric(&runtime.metrics.wire_failures, 1).await;
     wait_for_watch_connected(&runtime.metrics, false).await;
     assert_eq!(runtime.metrics.watch_disconnects.load(Ordering::Relaxed), 1);
-    tokio::time::advance(Duration::from_millis(125)).await;
+    runtime.time.advance(Duration::from_millis(125)).await;
     source.wait_for_watches(2).await;
     wait_for_watch_connected(&runtime.metrics, true).await;
     assert_rejected(
@@ -196,13 +202,66 @@ async fn wire_failure_reconnects_and_clears_state() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
+async fn wire_failure_opening_watch_is_recorded() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    source
+        .push_watch_error(DecisionSourceError::new(
+            DecisionSourceErrorKind::Wire,
+            "invalid watch response",
+        ))
+        .await;
+    source.push_pending_watch().await;
+    let TestRuntime {
+        watcher, metrics, ..
+    } = runtime(Arc::clone(&source), &ConfigOptions::default());
+    let task = tokio::spawn(watcher);
+
+    wait_for_metric(&metrics.watch_open_failures, 1).await;
+    wait_for_metric(&metrics.wire_failures, 1).await;
+
+    task.abort();
+    task.await.expect_err("watcher task is aborted");
+}
+
+#[tokio::test]
+async fn stopping_a_stable_watcher_marks_health_disconnected() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(
+        source,
+        &ConfigOptions {
+            unary_timeout: Duration::from_millis(1),
+            admission_timeout: Duration::from_millis(20),
+            ..ConfigOptions::default()
+        },
+    )
+    .await;
+    runtime.time.advance(Duration::from_secs(5)).await;
+    wait_for_health(&runtime.health, true).await;
+    let health = Arc::clone(&runtime.health);
+    let time = runtime.time.clone();
+
+    runtime.stop().await;
+    assert!(matches!(
+        health.status(),
+        DecisionSourceHealthStatus::NotYetStable
+    ));
+    time.advance(Duration::from_millis(20)).await;
+    assert!(matches!(
+        health.status(),
+        DecisionSourceHealthStatus::Failed
+    ));
+}
+
+#[tokio::test]
 async fn sustained_disconnect_promotes_health_from_warning_to_failed() {
     let source = Arc::new(ScriptedDecisionSource::default());
-    let PolicyGateRuntime {
+    let TestRuntime {
         watcher,
         health,
         metrics,
+        time,
         ..
     } = runtime(
         Arc::clone(&source),
@@ -217,7 +276,7 @@ async fn sustained_disconnect_promotes_health_from_warning_to_failed() {
         health.status(),
         DecisionSourceHealthStatus::NotYetStable
     ));
-    tokio::time::advance(Duration::from_millis(30)).await;
+    time.advance(Duration::from_millis(30)).await;
     assert!(matches!(
         health.status(),
         DecisionSourceHealthStatus::Failed
@@ -240,13 +299,12 @@ async fn sustained_disconnect_promotes_health_from_warning_to_failed() {
         health.status(),
         DecisionSourceHealthStatus::Failed
     ));
-    tokio::time::advance(Duration::from_millis(4_999)).await;
+    time.advance(Duration::from_millis(4_999)).await;
     assert!(!matches!(
         health.status(),
         DecisionSourceHealthStatus::Stable
     ));
-    tokio::time::advance(Duration::from_millis(1)).await;
-    wait_for_health(&health, true).await;
+    time.advance(Duration::from_millis(1)).await;
     assert!(matches!(
         health.status(),
         DecisionSourceHealthStatus::Stable
@@ -255,16 +313,17 @@ async fn sustained_disconnect_promotes_health_from_warning_to_failed() {
     task.await.expect("watch task joins");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn flapping_watch_streams_still_promote_health_to_failed() {
     let source = Arc::new(ScriptedDecisionSource::default());
     drop(source.push_live_watch(Vec::new()).await);
     drop(source.push_live_watch(Vec::new()).await);
     let _stable_watch = source.push_live_watch(Vec::new()).await;
-    let PolicyGateRuntime {
+    let TestRuntime {
         watcher,
         health,
         metrics,
+        time,
         ..
     } = runtime(
         Arc::clone(&source),
@@ -286,27 +345,24 @@ async fn flapping_watch_streams_still_promote_health_to_failed() {
     });
 
     source.wait_for_watches(1).await;
-    for _ in 0..1_000 {
-        if source.watch_calls() >= 3 {
-            break;
-        }
-        tokio::time::advance(Duration::from_millis(1)).await;
-    }
-    assert_eq!(source.watch_calls(), 3);
+    time.advance(Duration::from_millis(125)).await;
+    source.wait_for_watches(2).await;
+    time.advance(Duration::from_millis(250)).await;
+    source.wait_for_watches(3).await;
     wait_for_watch_connected(&metrics, true).await;
-    tokio::time::advance(Duration::from_millis(30)).await;
+    time.advance(Duration::from_millis(30)).await;
     assert!(matches!(
         health.status(),
         DecisionSourceHealthStatus::Failed
     ));
 
-    tokio::time::advance(Duration::from_secs(5)).await;
+    time.advance(Duration::from_secs(5)).await;
     wait_for_health(&health, true).await;
     drop(shutdown.send(()));
     task.await.expect("watch task joins");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn reconnect_backoff_resets_only_after_a_stable_stream() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let first = source.push_live_watch(Vec::new()).await;
@@ -319,34 +375,33 @@ async fn reconnect_backoff_resets_only_after_a_stable_stream() {
         ..ConfigOptions::default()
     };
     let runtime = start_runtime(Arc::clone(&source), &options).await;
-    tokio::time::advance(Duration::from_secs(2)).await;
+    runtime.time.advance(Duration::from_secs(2)).await;
     wait_for_health(&runtime.health, true).await;
 
     drop(first);
     wait_for_watch_connected(&runtime.metrics, false).await;
-    tokio::time::advance(Duration::from_millis(249)).await;
+    runtime.time.advance(Duration::from_millis(249)).await;
     source.wait_for_watches(2).await;
     wait_for_watch_connected(&runtime.metrics, true).await;
     drop(second);
     wait_for_watch_connected(&runtime.metrics, false).await;
-    tokio::time::advance(Duration::from_millis(299)).await;
+    runtime.time.advance(Duration::from_millis(299)).await;
     assert_eq!(source.watch_calls(), 2);
-    tokio::time::advance(Duration::from_millis(200)).await;
+    runtime.time.advance(Duration::from_millis(200)).await;
     source.wait_for_watches(3).await;
     wait_for_watch_connected(&runtime.metrics, true).await;
 
-    tokio::time::advance(Duration::from_millis(1_999)).await;
+    runtime.time.advance(Duration::from_millis(1_999)).await;
     assert!(!matches!(
         runtime.health.status(),
         DecisionSourceHealthStatus::Stable
     ));
-    tokio::time::advance(Duration::from_millis(1)).await;
-    wait_for_health(&runtime.health, true).await;
+    runtime.time.advance(Duration::from_millis(1)).await;
     drop(third);
     wait_for_watch_connected(&runtime.metrics, false).await;
-    tokio::time::advance(Duration::from_millis(149)).await;
+    runtime.time.advance(Duration::from_millis(149)).await;
     assert_eq!(source.watch_calls(), 3);
-    tokio::time::advance(Duration::from_millis(100)).await;
+    runtime.time.advance(Duration::from_millis(100)).await;
     source.wait_for_watches(4).await;
     runtime.stop().await;
 }

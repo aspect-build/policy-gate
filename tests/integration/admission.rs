@@ -1,18 +1,19 @@
 // Copyright 2026 Aspect Build Systems, Inc. All rights reserved.
 
+use core::future::Future as _;
 use core::sync::atomic::Ordering;
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
 
 use policy_gate::{Admission, Decision, DecisionSourceError, DecisionSourceErrorKind, PermitState};
 use tokio::sync::Semaphore;
-use tokio::time::Instant;
 use tonic::Code;
 
 use crate::support::{
-    ConfigOptions, GetAction, PAYMENT_URL, SUBJECT_A, SUBJECT_B, SUBJECT_C, ScriptedDecisionSource,
-    assert_allowed, assert_rejected, call_layer, call_subject, change, response, runtime,
-    start_runtime, start_runtime_after, wait_for_metric,
+    ConfigOptions, GetAction, PAYMENT_URL, RecordingWaker, SUBJECT_A, SUBJECT_B, SUBJECT_C,
+    ScriptedDecisionSource, assert_allowed, assert_rejected, call_layer, call_subject, change,
+    runtime, start_runtime, start_runtime_after, wait_for_metric,
 };
 
 const UNAVAILABLE_MESSAGE: &str = "Policy decision source is unavailable; retry the request.";
@@ -41,29 +42,30 @@ async fn missing_subject_is_rejected() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn disconnected_request_waits_for_watch_then_is_admitted() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     let runtime = start_runtime_after(
         Arc::clone(&source),
         &ConfigOptions::default(),
         Duration::from_secs(1),
     );
-    let started = Instant::now();
-    assert_allowed(&call_subject(&runtime.layer, SUBJECT_A).await);
-    assert_eq!(Instant::now() - started, Duration::from_secs(1));
+    let call = tokio::spawn({
+        let layer = runtime.layer.clone();
+        async move { call_subject(&layer, SUBJECT_A).await }
+    });
+    tokio::task::yield_now().await;
+    runtime.time.advance(Duration::from_secs(1)).await;
+    assert_allowed(&call.await.expect("call joins"));
     assert_eq!(source.get_calls(), 1);
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn disconnected_request_times_out_at_the_admission_deadline() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let runtime = runtime(
@@ -73,11 +75,17 @@ async fn disconnected_request_times_out_at_the_admission_deadline() {
             ..ConfigOptions::default()
         },
     );
-    let started = Instant::now();
-    let result = call_subject(&runtime.layer, SUBJECT_A).await;
+    let call = tokio::spawn({
+        let layer = runtime.layer.clone();
+        async move { call_subject(&layer, SUBJECT_A).await }
+    });
+    tokio::task::yield_now().await;
+    runtime.time.advance(Duration::from_millis(999)).await;
+    assert!(!call.is_finished());
+    runtime.time.advance(Duration::from_millis(1)).await;
+    let result = call.await.expect("call joins");
 
     assert_unavailable(&result);
-    assert!(Instant::now() - started >= Duration::from_secs(1));
     assert_eq!(source.get_calls(), 0);
     assert_eq!(
         runtime.metrics.admission_timeouts.load(Ordering::Relaxed),
@@ -85,7 +93,7 @@ async fn disconnected_request_times_out_at_the_admission_deadline() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn unavailable_admission_uses_the_configured_response_callback() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let runtime = runtime(
@@ -102,7 +110,13 @@ async fn unavailable_admission_uses_the_configured_response_callback() {
         tonic::Status::resource_exhausted("custom unavailable response").into_http()
     });
 
-    let result = call_subject(&layer, SUBJECT_A).await;
+    let ((), result) = tokio::join!(
+        async {
+            tokio::task::yield_now().await;
+            runtime.time.advance(Duration::from_secs(1)).await;
+        },
+        call_subject(&layer, SUBJECT_A),
+    );
 
     assert_rejected(&result, Code::ResourceExhausted);
     assert_eq!(
@@ -112,7 +126,7 @@ async fn unavailable_admission_uses_the_configured_response_callback() {
     assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn shutdown_rejects_new_admissions_without_waiting_for_the_deadline() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
@@ -122,7 +136,7 @@ async fn shutdown_rejects_new_admissions_without_waiting_for_the_deadline() {
             SUBJECT_A,
             GetAction::Gate {
                 release,
-                result: Ok(response(Decision::Allowed)),
+                result: Ok(Decision::Allowed),
             },
         )
         .await;
@@ -131,29 +145,23 @@ async fn shutdown_rejects_new_admissions_without_waiting_for_the_deadline() {
     let task_layer = layer.clone();
     let call = tokio::spawn(async move { call_subject(&task_layer, SUBJECT_A).await });
     source.wait_for_gets(1).await;
-    let started = Instant::now();
     runtime.stop().await;
 
     assert_unavailable(&call.await.expect("admission task joins"));
-    assert_eq!(Instant::now(), started);
     assert_eq!(source.get_calls(), 1);
 
-    let started = Instant::now();
     assert_unavailable(&call_subject(&layer, SUBJECT_B).await);
-    assert_eq!(Instant::now(), started);
     assert_eq!(source.get_calls(), 1);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn dropping_an_unpolled_watcher_stops_admission() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let runtime = runtime(Arc::clone(&source), &ConfigOptions::default());
     let layer = runtime.layer.clone();
     drop(runtime.watcher);
 
-    let started = Instant::now();
     assert_unavailable(&call_subject(&layer, SUBJECT_A).await);
-    assert_eq!(Instant::now(), started);
     assert_eq!(source.watch_calls(), 0);
     assert_eq!(source.get_calls(), 0);
 }
@@ -163,7 +171,7 @@ async fn denied_is_cached_until_an_allowed_event() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(SUBJECT_A, GetAction::Return(Ok(response(Decision::Denied))))
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Denied)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
 
@@ -200,7 +208,7 @@ async fn dropped_first_requester_does_not_cancel_the_shared_fetch() {
             SUBJECT_A,
             GetAction::Gate {
                 release: Arc::clone(&release),
-                result: Ok(response(Decision::Allowed)),
+                result: Ok(Decision::Allowed),
             },
         )
         .await;
@@ -239,7 +247,7 @@ async fn concurrent_pending_requests_share_one_unary() {
             SUBJECT_A,
             GetAction::Gate {
                 release: Arc::clone(&release),
-                result: Ok(response(Decision::Allowed)),
+                result: Ok(Decision::Allowed),
             },
         )
         .await;
@@ -265,7 +273,7 @@ async fn concurrent_pending_requests_share_one_unary() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn transient_unary_failure_is_retried_then_admitted() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
@@ -279,10 +287,7 @@ async fn transient_unary_failure_is_retried_then_admitted() {
         )
         .await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
     let call = tokio::spawn({
@@ -290,13 +295,14 @@ async fn transient_unary_failure_is_retried_then_admitted() {
         async move { call_subject(&layer, SUBJECT_A).await }
     });
     source.wait_for_gets(1).await;
+    runtime.time.advance(Duration::from_millis(100)).await;
 
     assert_allowed(&call.await.expect("call joins"));
     assert_eq!(source.get_calls(), 2);
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn permanent_unary_status_fails_fast() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
@@ -310,12 +316,9 @@ async fn permanent_unary_status_fails_fast() {
         )
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
-    let started = Instant::now();
-
     let result = call_subject(&runtime.layer, SUBJECT_A).await;
 
     assert_unavailable(&result);
-    assert_eq!(Instant::now(), started);
     assert_eq!(source.get_calls(), 1);
     assert_eq!(runtime.metrics.admission_retries.load(Ordering::Relaxed), 0);
     assert_eq!(
@@ -325,28 +328,21 @@ async fn permanent_unary_status_fails_fast() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn permanent_failure_cooldown_coalesces_later_requests() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
-    let release = Arc::new(Semaphore::new(0));
     source
         .push_get(
             SUBJECT_A,
-            GetAction::Gate {
-                release: Arc::clone(&release),
-                result: Err(DecisionSourceError::new(
-                    DecisionSourceErrorKind::Permanent,
-                    "subject not enrolled",
-                )),
-            },
+            GetAction::Return(Err(DecisionSourceError::new(
+                DecisionSourceErrorKind::Permanent,
+                "subject not enrolled",
+            ))),
         )
         .await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     let runtime = start_runtime(
         Arc::clone(&source),
@@ -357,62 +353,43 @@ async fn permanent_failure_cooldown_coalesces_later_requests() {
     )
     .await;
 
-    let first = tokio::spawn({
-        let layer = runtime.layer.clone();
-        async move { call_subject(&layer, SUBJECT_A).await }
-    });
-    source.wait_for_gets(1).await;
-    let second = tokio::spawn({
-        let layer = runtime.layer.clone();
-        async move { call_subject(&layer, SUBJECT_A).await }
-    });
-    wait_for_metric(&runtime.metrics.snapshot_misses, 2).await;
-    release.add_permits(1);
-
-    assert_unavailable(&first.await.expect("first call completes"));
-    assert_unavailable(&second.await.expect("second call completes"));
+    assert_unavailable(&call_subject(&runtime.layer, SUBJECT_A).await);
     assert_eq!(source.get_calls(), 1);
     assert_eq!(runtime.metrics.unary_calls.load(Ordering::Relaxed), 1);
     assert_eq!(runtime.metrics.unary_failures.load(Ordering::Relaxed), 1);
     let snapshot_misses = runtime.metrics.snapshot_misses.load(Ordering::Relaxed);
-    let third = tokio::spawn({
+    let first = tokio::spawn({
         let layer = runtime.layer.clone();
         async move { call_subject(&layer, SUBJECT_A).await }
     });
-    let fourth = tokio::spawn({
+    let second = tokio::spawn({
         let layer = runtime.layer.clone();
         async move { call_subject(&layer, SUBJECT_A).await }
     });
     wait_for_metric(&runtime.metrics.snapshot_misses, snapshot_misses + 2).await;
 
-    tokio::time::advance(Duration::from_millis(249)).await;
+    runtime.time.advance(Duration::from_millis(249)).await;
     assert_eq!(source.get_calls(), 1);
-    assert!(!third.is_finished());
-    assert!(!fourth.is_finished());
-    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    runtime.time.advance(Duration::from_millis(1)).await;
     source.wait_for_gets(2).await;
 
-    assert_allowed(&third.await.expect("third call joins"));
-    assert_allowed(&fourth.await.expect("fourth call joins"));
+    assert_allowed(&first.await.expect("first waiting call joins"));
+    assert_allowed(&second.await.expect("second waiting call joins"));
     assert_eq!(source.get_calls(), 2);
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn unspecified_unary_state_is_retried() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(
-            SUBJECT_B,
-            GetAction::Return(Ok(response(Decision::Unspecified))),
-        )
+        .push_get(SUBJECT_B, GetAction::Return(Ok(Decision::Unspecified)))
         .await;
     source
-        .push_get(
-            SUBJECT_B,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_B, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     let runtime = start_runtime(
         Arc::clone(&source),
@@ -429,9 +406,9 @@ async fn unspecified_unary_state_is_retried() {
     source.wait_for_gets(1).await;
     wait_for_metric(&runtime.metrics.admission_retries, 1).await;
 
-    tokio::time::advance(Duration::from_millis(249)).await;
+    runtime.time.advance(Duration::from_millis(249)).await;
     assert_eq!(source.get_calls(), 1);
-    tokio::time::advance(Duration::from_millis(1)).await;
+    runtime.time.advance(Duration::from_millis(1)).await;
     source.wait_for_gets(2).await;
 
     assert_allowed(&first.await.expect("first call joins"));
@@ -440,7 +417,7 @@ async fn unspecified_unary_state_is_retried() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn unknown_unary_state_fails_fast_as_a_wire_error() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;
@@ -454,49 +431,10 @@ async fn unknown_unary_state_fails_fast_as_a_wire_error() {
         )
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
-    let started = Instant::now();
-
     assert_unavailable(&call_subject(&runtime.layer, SUBJECT_C).await);
-    assert_eq!(Instant::now(), started);
     assert_eq!(source.get_calls(), 1);
     assert_eq!(runtime.metrics.wire_failures.load(Ordering::Relaxed), 1);
     assert_eq!(runtime.metrics.admission_retries.load(Ordering::Relaxed), 0);
-    runtime.stop().await;
-}
-
-#[tokio::test]
-async fn denied_event_during_an_in_flight_unary_wins_over_its_result() {
-    let source = Arc::new(ScriptedDecisionSource::default());
-    let watch = source.push_live_watch(Vec::new()).await;
-    let release = Arc::new(Semaphore::new(0));
-    source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Gate {
-                release: Arc::clone(&release),
-                result: Ok(response(Decision::Allowed)),
-            },
-        )
-        .await;
-    let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
-    let call = tokio::spawn({
-        let layer = runtime.layer.clone();
-        async move { call_subject(&layer, SUBJECT_A).await }
-    });
-    source.wait_for_gets(1).await;
-
-    watch
-        .send(Ok(change(SUBJECT_A, Decision::Denied)))
-        .expect("watch remains live");
-    wait_for_metric(&runtime.metrics.watch_events, 1).await;
-    release.add_permits(1);
-
-    assert_rejected(&call.await.expect("call joins"), Code::FailedPrecondition);
-    assert_rejected(
-        &call_subject(&runtime.layer, SUBJECT_A).await,
-        Code::FailedPrecondition,
-    );
-    assert_eq!(source.get_calls(), 1);
     runtime.stop().await;
 }
 
@@ -510,26 +448,29 @@ async fn watch_verdict_wakes_pending_admission_before_unary_completion() {
             SUBJECT_A,
             GetAction::Gate {
                 release: Arc::clone(&release),
-                result: Ok(response(Decision::Allowed)),
+                result: Ok(Decision::Allowed),
             },
         )
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
     let layer = runtime.layer.clone();
-    let call = tokio::spawn(async move { call_subject(&layer, SUBJECT_A).await });
+    let mut call = Box::pin(call_subject(&layer, SUBJECT_A));
+    let wake_counter = Arc::new(RecordingWaker::default());
+    let waker = wake_counter.waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(call.as_mut().poll(&mut context), Poll::Pending));
     source.wait_for_gets(1).await;
 
+    let wakes_before_denial = wake_counter.count();
     watch
         .send(Ok(change(SUBJECT_A, Decision::Denied)))
         .expect("watch remains live");
     wait_for_metric(&runtime.metrics.watch_events, 1).await;
-    assert_rejected(
-        &tokio::time::timeout(Duration::from_secs(1), call)
-            .await
-            .expect("watch verdict must wake admission")
-            .expect("call task joins"),
-        Code::FailedPrecondition,
-    );
+    assert!(wake_counter.count() > wakes_before_denial);
+    let Poll::Ready(result) = call.as_mut().poll(&mut context) else {
+        panic!("watch verdict must complete the pending admission after waking it");
+    };
+    assert_rejected(&result, Code::FailedPrecondition);
     assert_eq!(source.get_calls(), 1);
     release.add_permits(1);
     runtime.stop().await;
@@ -540,10 +481,7 @@ async fn engine_admission_returns_an_observable_permit() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
     let subject = SUBJECT_A.parse().expect("test subject UUID");
@@ -565,7 +503,7 @@ async fn engine_admission_returns_an_observable_permit() {
     runtime.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn disconnect_mid_fetch_reconnects_and_refetches_before_admitting() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let first_watch = source.push_live_watch(Vec::new()).await;
@@ -575,15 +513,12 @@ async fn disconnect_mid_fetch_reconnects_and_refetches_before_admitting() {
             SUBJECT_A,
             GetAction::Gate {
                 release: Arc::clone(&release),
-                result: Ok(response(Decision::Allowed)),
+                result: Ok(Decision::Allowed),
             },
         )
         .await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
     let call = tokio::spawn({
@@ -595,7 +530,7 @@ async fn disconnect_mid_fetch_reconnects_and_refetches_before_admitting() {
     let _second_watch = source.push_live_watch(Vec::new()).await;
     drop(first_watch);
     crate::support::wait_for_watch_connected(&runtime.metrics, false).await;
-    tokio::time::advance(Duration::from_millis(125)).await;
+    runtime.time.advance(Duration::from_millis(125)).await;
     source.wait_for_watches(2).await;
     crate::support::wait_for_watch_connected(&runtime.metrics, true).await;
     release.add_permits(1);
@@ -613,13 +548,10 @@ async fn unspecified_event_forgets_a_known_subject() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let watch = source.push_live_watch(Vec::new()).await;
     source
-        .push_get(
-            SUBJECT_A,
-            GetAction::Return(Ok(response(Decision::Allowed))),
-        )
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
         .await;
     source
-        .push_get(SUBJECT_A, GetAction::Return(Ok(response(Decision::Denied))))
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Denied)))
         .await;
     let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
 

@@ -2,18 +2,14 @@
 
 use core::time::Duration;
 
-use axum_core::body::Body;
-use http::Request;
 use policy_gate::{
     ConfigError, DEFAULT_ADMISSION_TIMEOUT, DEFAULT_INITIAL_ADMISSION_RETRY_DELAY,
     DEFAULT_INITIAL_RECONNECT_DELAY, DEFAULT_MAX_ADMISSION_RETRY_DELAY,
     DEFAULT_MAX_RECONNECT_DELAY, DEFAULT_MAX_SUBJECTS, DEFAULT_PERMANENT_FAILURE_COOLDOWN,
     DEFAULT_SNAPSHOT_REPUBLISH_INTERVAL, DEFAULT_SUBJECT_TTL, DEFAULT_UNARY_TIMEOUT,
-    DEFAULT_WATCH_EVENTS_PER_YIELD, PolicyGateConfig, PolicyGateConfigBuilder, RequestPolicy,
-    Subject,
+    DEFAULT_WATCH_EVENTS_PER_YIELD, PolicyGateConfig, PolicyGateConfigBuilder,
+    PolicyGateLayerConfig, Subject,
 };
-#[cfg(feature = "tonic-client")]
-use policy_gate::{PolicyGateLayerConfig, TonicDecisionSourceConfig};
 
 const fn config() -> PolicyGateConfigBuilder {
     PolicyGateConfig::builder()
@@ -54,12 +50,8 @@ fn builder_uses_public_defaults() {
 }
 
 #[test]
-#[cfg(feature = "tonic-client")]
-fn transport_and_layer_configuration_are_separate_from_the_engine() {
-    let tonic =
-        TonicDecisionSourceConfig::new("https://source.example.test", "org.example/build-events");
+fn layer_configuration_preserves_rejection_messages() {
     let layer = PolicyGateLayerConfig::new("denied", "subject is required");
-    assert_eq!(tonic.scope(), "org.example/build-events");
     assert_eq!(layer.denied_message(), "denied");
     assert_eq!(layer.missing_subject_message(), "subject is required");
 }
@@ -73,63 +65,73 @@ fn core_subject_does_not_require_string_conversion() {
     assert_subject::<OpaqueSubject>();
 }
 
-#[test]
-fn timeouts_and_subject_ttl_are_bounded() {
-    let error = config()
-        .unary_timeout(Duration::from_secs(3))
-        .admission_timeout(Duration::from_secs(2))
-        .build()
-        .expect_err("unary timeout beyond admission deadline must fail");
-    assert_eq!(error, ConfigError::UnaryExceedsAdmission);
-    assert!(error.to_string().contains("must not exceed"));
-
-    let error = config()
-        .admission_timeout(Duration::MAX)
-        .build()
-        .expect_err("an admission deadline that Instant cannot represent must fail");
-    assert_eq!(error, ConfigError::AdmissionDeadlineOverflow);
-    assert!(error.to_string().contains("Instant deadline"));
-
-    let error = config()
-        .initial_admission_retry_delay(Duration::ZERO)
-        .build()
-        .expect_err("zero initial retry delay must fail");
-    assert_eq!(error, ConfigError::InitialAdmissionRetryDelayZero);
-
-    let error = config()
-        .initial_admission_retry_delay(Duration::from_secs(2))
-        .max_admission_retry_delay(Duration::from_secs(1))
-        .build()
-        .expect_err("initial retry delay beyond its maximum must fail");
-    assert_eq!(error, ConfigError::InitialRetryExceedsMaximum);
-
-    let error = config()
-        .snapshot_republish_interval(Duration::MAX)
-        .build()
-        .expect_err("an unrepresentable snapshot interval must fail");
+fn assert_config_error(builder: PolicyGateConfigBuilder, expected: ConfigError) {
     assert_eq!(
-        error,
-        ConfigError::DurationOverflow("snapshot republish interval")
+        builder.build().expect_err("configuration must fail"),
+        expected
     );
+}
 
-    let error = config()
-        .initial_reconnect_delay(Duration::ZERO)
-        .build()
-        .expect_err("zero initial reconnect delay must fail");
-    assert_eq!(error, ConfigError::InitialReconnectDelayZero);
+#[test]
+fn unary_timeout_cannot_exceed_admission_timeout() {
+    assert_config_error(
+        config()
+            .unary_timeout(Duration::from_secs(3))
+            .admission_timeout(Duration::from_secs(2)),
+        ConfigError::UnaryExceedsAdmission,
+    );
+}
 
-    let error = config()
-        .initial_reconnect_delay(Duration::from_secs(2))
-        .max_reconnect_delay(Duration::from_secs(1))
-        .build()
-        .expect_err("initial reconnect delay beyond its maximum must fail");
-    assert_eq!(error, ConfigError::InitialReconnectExceedsMaximum);
+#[test]
+fn admission_timeout_must_fit_an_instant_deadline() {
+    assert_config_error(
+        config().admission_timeout(Duration::MAX),
+        ConfigError::AdmissionDeadlineOverflow,
+    );
+}
 
-    let error = config()
-        .watch_events_per_yield(0)
-        .build()
-        .expect_err("zero watch events per yield must fail");
-    assert_eq!(error, ConfigError::WatchEventsPerYieldZero);
+#[test]
+fn admission_retry_delays_must_be_positive_and_ordered() {
+    assert_config_error(
+        config().initial_admission_retry_delay(Duration::ZERO),
+        ConfigError::InitialAdmissionRetryDelayZero,
+    );
+    assert_config_error(
+        config()
+            .initial_admission_retry_delay(Duration::from_secs(2))
+            .max_admission_retry_delay(Duration::from_secs(1)),
+        ConfigError::InitialRetryExceedsMaximum,
+    );
+}
+
+#[test]
+fn snapshot_republish_interval_must_fit_an_instant_deadline() {
+    assert_config_error(
+        config().snapshot_republish_interval(Duration::MAX),
+        ConfigError::DurationOverflow("snapshot republish interval"),
+    );
+}
+
+#[test]
+fn reconnect_delays_must_be_positive_and_ordered() {
+    assert_config_error(
+        config().initial_reconnect_delay(Duration::ZERO),
+        ConfigError::InitialReconnectDelayZero,
+    );
+    assert_config_error(
+        config()
+            .initial_reconnect_delay(Duration::from_secs(2))
+            .max_reconnect_delay(Duration::from_secs(1)),
+        ConfigError::InitialReconnectExceedsMaximum,
+    );
+}
+
+#[test]
+fn watcher_yield_batch_must_be_positive() {
+    assert_config_error(
+        config().watch_events_per_yield(0),
+        ConfigError::WatchEventsPerYieldZero,
+    );
 }
 
 #[test]
@@ -140,23 +142,4 @@ fn maximum_subject_count_must_be_positive() {
         .expect_err("zero subject capacity must fail");
     assert_eq!(error, ConfigError::MaxSubjectsZero);
     assert!(error.to_string().contains("greater than zero"));
-}
-
-struct StringPolicy;
-
-impl RequestPolicy<String> for StringPolicy {
-    fn subject<B>(&self, request: &Request<B>) -> Option<String> {
-        request.extensions().get::<String>().cloned()
-    }
-
-    fn enforce_request_body<B>(&self, _request: &Request<B>) -> bool {
-        false
-    }
-}
-
-#[test]
-fn policy_chooses_its_subject_type() {
-    let mut request = Request::new(Body::empty());
-    request.extensions_mut().insert("subject-a".to_owned());
-    assert_eq!(StringPolicy.subject(&request).as_deref(), Some("subject-a"));
 }

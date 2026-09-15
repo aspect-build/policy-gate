@@ -53,6 +53,89 @@
 //! # }
 //! ```
 //!
+//! ## HTTP middleware
+//!
+//! Authenticate first, place a trusted subject in the request extensions, and let the policy
+//! layer enforce the authority's decision for that subject:
+//!
+//! ```no_run
+//! # use core::future::Future;
+//! # use core::pin::Pin;
+//! # use core::task::{Context, Poll};
+//! # use std::sync::Arc;
+//! # use axum::extract::Request;
+//! # use axum::http::{StatusCode, header};
+//! # use axum::middleware::{self, Next};
+//! # use axum::response::Response;
+//! # use axum::{Router, routing::get};
+//! # use futures_core::Stream;
+//! # use policy_gate::{Decision, DecisionChange, DecisionSource, DecisionSourceError};
+//! use policy_gate::{
+//!     AxumBodyAdapter, PolicyGate, PolicyGateConfig, PolicyGateLayer,
+//!     PolicyGateLayerConfig, RequestPolicy,
+//! };
+//!
+//! #[derive(Clone)]
+//! struct AuthenticatedUser(String);
+//!
+//! #[derive(Clone, Copy)]
+//! struct UserFromAuth;
+//! impl RequestPolicy<String> for UserFromAuth {
+//!     fn subject<B>(&self, request: &http::Request<B>) -> Option<String> {
+//!         request.extensions().get::<AuthenticatedUser>().map(|u| u.0.clone())
+//!     }
+//!     fn enforce_request_body<B>(&self, _: &http::Request<B>) -> bool { false }
+//! }
+//!
+//! async fn authenticate(mut request: Request, next: Next) -> Result<Response, StatusCode> {
+//!     let token = request.headers().get(header::AUTHORIZATION)
+//!         .and_then(|value| value.to_str().ok())
+//!         .ok_or(StatusCode::UNAUTHORIZED)?;
+//!     let user = validate_token(token).ok_or(StatusCode::UNAUTHORIZED)?;
+//!     request.extensions_mut().insert(AuthenticatedUser(user));
+//!     Ok(next.run(request).await)
+//! }
+//! # fn validate_token(_: &str) -> Option<String> { Some("user-123".into()) }
+//! # struct Never;
+//! # impl Stream for Never {
+//! #     type Item = Result<DecisionChange<String>, DecisionSourceError>;
+//! #     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+//! #         Poll::Pending
+//! #     }
+//! # }
+//! # struct Authority;
+//! # impl DecisionSource<String> for Authority {
+//! #     type Changes = Never;
+//! #     fn get_subject_decision(&self, _: &String)
+//! #         -> impl Future<Output = Result<Decision, DecisionSourceError>> + Send {
+//! #         core::future::ready(Ok(Decision::Allowed))
+//! #     }
+//! #     fn watch_subject_decisions(&self)
+//! #         -> impl Future<Output = Result<Self::Changes, DecisionSourceError>> + Send {
+//! #         core::future::ready(Ok(Never))
+//! #     }
+//! # }
+//! # #[tokio::main]
+//! # async fn main() {
+//! let config = PolicyGateConfig::builder().build().unwrap();
+//! let (gate, watcher, _) = PolicyGate::new(&config, Arc::new(Authority));
+//! tokio::spawn(watcher);
+//! let policy = PolicyGateLayer::new(
+//!     gate,
+//!     &PolicyGateLayerConfig::new("access denied", "missing authenticated user"),
+//!     UserFromAuth,
+//!     AxumBodyAdapter,
+//! );
+//!
+//! // Axum applies layers bottom-to-top, so authentication runs before policy enforcement.
+//! let app = Router::new()
+//!     .route("/", get(|| async { "allowed" }))
+//!     .layer(policy)
+//!     .layer(middleware::from_fn(authenticate));
+//! # let _: Router = app;
+//! # }
+//! ```
+//!
 //! # Feature flags
 //!
 //! The core gate, its configuration, the watcher, and the metrics trait are always available. Each
@@ -294,7 +377,7 @@ impl PolicyGateConfig {
         self.permanent_failure_cooldown
     }
 
-    /// Minimum interval between rebuilds of the lock-free snapshot read by
+    /// Minimum interval between rebuilds of the cached decision snapshot read by
     /// [`PolicyGate::try_cached`].
     ///
     /// Until a rebuild runs, a newly cached subject is served through the slower map path in

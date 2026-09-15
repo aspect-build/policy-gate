@@ -3,7 +3,6 @@
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
-use std::time::Instant;
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -37,8 +36,6 @@ pub(crate) struct EnforcedBody<
     response: R,
     // Polled once per frame so policy recovery does not stall the stream.
     readmission: Option<Readmission>,
-    // Suppresses another attempt until one admission budget has elapsed.
-    last_readmission_failure: Option<Instant>,
     side: BodySide,
     ended: bool,
 }
@@ -69,7 +66,6 @@ impl<
             context,
             response,
             readmission: None,
-            last_readmission_failure: None,
             side,
             ended: false,
         }
@@ -131,7 +127,6 @@ where
                 PermitState::Stale => {
                     if let Some(admission) = this.context.gate.try_cached(this.subject) {
                         *this.readmission = None;
-                        *this.last_readmission_failure = None;
                         match admission {
                             Admission::Allowed(permit) => {
                                 *this.permit = Some(permit);
@@ -141,19 +136,9 @@ where
                         }
                     }
                     if this.readmission.is_none() {
-                        let cooldown_elapsed = match *this.last_readmission_failure {
-                            Some(failed_at) => {
-                                this.context.gate.now().saturating_duration_since(failed_at)
-                                    >= this.context.gate.admission_timeout()
-                            }
-                            None => true,
-                        };
-                        if cooldown_elapsed {
-                            let gate = this.context.gate.clone();
-                            let subject = (*this.subject).clone();
-                            *this.readmission =
-                                Some(async move { gate.admit(subject).await }.boxed());
-                        }
+                        let gate = this.context.gate.clone();
+                        let subject = (*this.subject).clone();
+                        *this.readmission = Some(async move { gate.admit(subject).await }.boxed());
                     }
                     // Admission is polled once per frame, so it never makes this body pending.
                     if let Some(readmission) = this.readmission.as_mut() {
@@ -164,16 +149,19 @@ where
                                 match result {
                                     Ok(Admission::Allowed(permit)) => {
                                         *this.permit = Some(permit);
-                                        *this.last_readmission_failure = None;
                                         continue;
                                     }
                                     Ok(Admission::Denied) => {
-                                        *this.last_readmission_failure = None;
                                         break;
                                     }
                                     Err(_) => {
-                                        *this.last_readmission_failure =
-                                            Some(this.context.gate.now());
+                                        let gate = this.context.gate.clone();
+                                        let subject = (*this.subject).clone();
+                                        let delay = gate.admission_timeout();
+                                        *this.readmission = Some(
+                                            async move { gate.admit_after(subject, delay).await }
+                                                .boxed(),
+                                        );
                                     }
                                 }
                             }

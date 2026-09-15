@@ -89,6 +89,7 @@ pub struct DecisionWatcher<
 > {
     state: Arc<GateState<T, C, M, D>>,
     future: BoxFuture<'static, ()>,
+    stop: fn(&GateState<T, C, M, D>),
 }
 
 impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> core::fmt::Debug
@@ -116,7 +117,14 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver>
             time: state.time_driver(),
         });
         let future = watch_source(Arc::clone(&state), client, metrics).boxed();
-        (Self { state, future }, health)
+        (
+            Self {
+                state,
+                future,
+                stop: stop_watcher::<T, C, M, D>,
+            },
+            health,
+        )
     }
 }
 
@@ -134,8 +142,14 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> Drop
     for DecisionWatcher<T, C, M, D>
 {
     fn drop(&mut self) {
-        self.state.watch_stopping();
+        (self.stop)(&self.state);
     }
+}
+
+fn stop_watcher<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver>(
+    state: &GateState<T, C, M, D>,
+) {
+    state.watch_stopping();
 }
 
 async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver>(
@@ -193,6 +207,9 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
                 metrics.watch_disconnect();
             }
             Ok(Err(error)) => {
+                if error.kind() == DecisionSourceErrorKind::Wire {
+                    metrics.wire_failure();
+                }
                 tracing::warn!(?error, "failed to open policy authority watch");
                 metrics.watch_open_failure();
             }

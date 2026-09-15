@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use futures_util::stream::{self, StreamExt};
+use futures_util::task::{ArcWake, waker};
 use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
@@ -18,13 +19,17 @@ use policy_gate::{
     AxumBodyAdapter, Decision, DecisionChange, DecisionSource, DecisionSourceError,
     DecisionSourceHealth, DecisionSourceHealthStatus, PolicyGate, PolicyGateConfig,
     PolicyGateLayer, PolicyGateLayerConfig, PolicyGateMetrics, PolicyGateRuntime, RequestPolicy,
-    TonicRejectionResponse,
+    TimeDriver, TonicRejectionResponse,
 };
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Status;
 use tower::{Layer, ServiceExt, service_fn};
 use uuid::Uuid;
+
+#[path = "../support/time.rs"]
+mod time;
+pub(crate) use time::TestTimeDriver;
 
 pub(crate) const PAYMENT_URL: &str = "https://pay.example.test/billing";
 pub(crate) const SUBJECT_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -36,6 +41,25 @@ const CLIENT_STREAMING_PATHS: [&str; 2] = [
     "/google.bytestream.ByteStream/Write",
     "/google.devtools.build.v1.PublishBuildEvent/PublishBuildToolEventStream",
 ];
+
+#[derive(Default)]
+pub(crate) struct RecordingWaker(AtomicUsize);
+
+impl RecordingWaker {
+    pub(crate) fn waker(self: &Arc<Self>) -> core::task::Waker {
+        waker(Arc::clone(self))
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl ArcWake for RecordingWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TestSubject(pub(crate) Uuid);
@@ -63,6 +87,7 @@ pub(crate) type TestPolicyGateLayer = PolicyGateLayer<
     AxumBodyAdapter,
     TestMetrics,
     TonicRejectionResponse,
+    TestTimeDriver,
 >;
 
 #[derive(Debug, Default)]
@@ -188,12 +213,12 @@ enum WatchAction {
         mpsc::UnboundedReceiver<Result<DecisionChange<Uuid>, DecisionSourceError>>,
     ),
     PendingOpen,
+    Error(DecisionSourceError),
 }
 
 #[derive(Default)]
 pub(crate) struct ScriptedDecisionSource {
     gets: Mutex<HashMap<String, VecDeque<GetAction>>>,
-    get_subjects: Mutex<Vec<String>>,
     watches: Mutex<VecDeque<WatchAction>>,
     get_calls: AtomicUsize,
     get_completions: AtomicUsize,
@@ -227,6 +252,13 @@ impl ScriptedDecisionSource {
             .lock()
             .await
             .push_back(WatchAction::PendingOpen);
+    }
+
+    pub(crate) async fn push_watch_error(&self, error: DecisionSourceError) {
+        self.watches
+            .lock()
+            .await
+            .push_back(WatchAction::Error(error));
     }
 
     pub(crate) fn get_calls(&self) -> usize {
@@ -274,14 +306,13 @@ impl DecisionSource<Uuid> for ScriptedDecisionSource {
     async fn get_subject_decision(&self, subject: &Uuid) -> Result<Decision, DecisionSourceError> {
         let subject = subject.to_string();
         self.get_calls.fetch_add(1, Ordering::AcqRel);
-        self.get_subjects.lock().await.push(subject.clone());
         let action = self
             .gets
             .lock()
             .await
             .get_mut(&subject)
             .and_then(VecDeque::pop_front)
-            .unwrap_or_else(|| GetAction::Return(Ok(response(Decision::Allowed))));
+            .unwrap_or(GetAction::Return(Ok(Decision::Allowed)));
         let result = match action {
             GetAction::Return(result) => result,
             GetAction::Gate { release, result } => {
@@ -307,6 +338,7 @@ impl DecisionSource<Uuid> for ScriptedDecisionSource {
                 Ok(stream::iter(initial).chain(UnboundedReceiverStream::new(receiver)))
             }
             WatchAction::PendingOpen => core::future::pending().await,
+            WatchAction::Error(error) => Err(error),
         }
     }
 }
@@ -370,18 +402,26 @@ pub(crate) fn layer_config() -> PolicyGateLayerConfig {
     )
 }
 
-pub(crate) fn runtime(
-    source: Arc<ScriptedDecisionSource>,
-    options: &ConfigOptions,
-) -> PolicyGateRuntime<
-    TestPolicy,
-    Uuid,
-    ScriptedDecisionSource,
-    AxumBodyAdapter,
-    TestMetrics,
-    TonicRejectionResponse,
-> {
-    PolicyGateRuntime::new_with_client_metrics_and_response(
+pub(crate) struct TestRuntime {
+    pub(crate) gate: PolicyGate<Uuid, ScriptedDecisionSource, TestMetrics, TestTimeDriver>,
+    pub(crate) layer: TestPolicyGateLayer,
+    pub(crate) watcher:
+        policy_gate::DecisionWatcher<Uuid, ScriptedDecisionSource, TestMetrics, TestTimeDriver>,
+    pub(crate) health: Arc<DecisionSourceHealth<TestTimeDriver>>,
+    pub(crate) metrics: TestMetrics,
+    pub(crate) time: TestTimeDriver,
+}
+
+pub(crate) fn runtime(source: Arc<ScriptedDecisionSource>, options: &ConfigOptions) -> TestRuntime {
+    let time = TestTimeDriver::default();
+    let PolicyGateRuntime {
+        gate,
+        layer,
+        watcher,
+        health,
+        metrics,
+        ..
+    } = PolicyGateRuntime::new_with_client_metrics_response_and_time_driver(
         &validated(options),
         &layer_config(),
         source,
@@ -389,14 +429,24 @@ pub(crate) fn runtime(
         AxumBodyAdapter,
         test_metrics(),
         TonicRejectionResponse,
-    )
+        time.clone(),
+    );
+    TestRuntime {
+        gate,
+        layer,
+        watcher,
+        health,
+        metrics,
+        time,
+    }
 }
 
 pub(crate) struct RunningRuntime {
-    pub(crate) gate: PolicyGate<Uuid, ScriptedDecisionSource, TestMetrics>,
+    pub(crate) gate: PolicyGate<Uuid, ScriptedDecisionSource, TestMetrics, TestTimeDriver>,
     pub(crate) layer: TestPolicyGateLayer,
-    pub(crate) health: Arc<DecisionSourceHealth>,
+    pub(crate) health: Arc<DecisionSourceHealth<TestTimeDriver>>,
     pub(crate) metrics: TestMetrics,
+    pub(crate) time: TestTimeDriver,
     shutdown: broadcast::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -431,20 +481,21 @@ fn start_runtime_inner(
     options: &ConfigOptions,
     delay: Option<Duration>,
 ) -> RunningRuntime {
-    let PolicyGateRuntime {
+    let TestRuntime {
         gate,
         layer,
         watcher,
         health,
         metrics,
-        ..
+        time,
     } = runtime(source, options);
     let (shutdown, _) = broadcast::channel(1);
+    let task_time = time.clone();
     let task = tokio::spawn({
         let mut shutdown_rx = shutdown.subscribe();
         async move {
             if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
+                task_time.sleep(delay).await;
             }
             tokio::select! {
                 () = watcher => {}
@@ -457,13 +508,10 @@ fn start_runtime_inner(
         layer,
         health,
         metrics,
+        time,
         shutdown,
         task,
     }
-}
-
-pub(crate) const fn response(state: Decision) -> Decision {
-    state
 }
 
 pub(crate) fn change(subject: &str, state: Decision) -> DecisionChange<Uuid> {
@@ -623,6 +671,7 @@ pub(crate) async fn call_layer<R>(
         AxumBodyAdapter,
         TestMetrics,
         R,
+        TestTimeDriver,
     >,
     subject: Option<&str>,
 ) -> ObservedCall
@@ -664,6 +713,7 @@ pub(crate) async fn call_subject<R>(
         AxumBodyAdapter,
         TestMetrics,
         R,
+        TestTimeDriver,
     >,
     subject: &str,
 ) -> ObservedCall
@@ -673,13 +723,16 @@ where
     call_layer(layer, Some(subject)).await
 }
 
-pub(crate) async fn wait_for_health(health: &DecisionSourceHealth, expected_ok: bool) {
+pub(crate) async fn wait_for_health(
+    health: &DecisionSourceHealth<TestTimeDriver>,
+    expected_ok: bool,
+) {
     for _ in 0..WAIT_ITERATIONS {
         let is_ok = matches!(health.status(), DecisionSourceHealthStatus::Stable);
         if is_ok == expected_ok {
             return;
         }
-        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
     }
     panic!("health did not reach expected state");
 }

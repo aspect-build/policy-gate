@@ -9,6 +9,6 @@ fn canonical_policy_proto_has_expected_sha256() {
         .replace("\r\n", "\n");
     assert_eq!(
         format!("{:x}", Sha256::digest(text.as_bytes())),
-        "f2311efb3927c8c1254b683644d4c8f70fc1f81873a060a59c925dcf208bae70"
+        "416af0c4938fda55d896d18bb6e5ab7759053f86ab7d4d59deda18d118fd974e"
     );
 }

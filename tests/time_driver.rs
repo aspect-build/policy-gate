@@ -1,38 +1,63 @@
 // Copyright 2026 Aspect Build Systems, Inc. All rights reserved.
 
-use core::future::{Future, ready};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
-use std::time::Instant;
+use std::sync::Arc;
 
-use futures_util::FutureExt;
-use policy_gate::{TimeDriver, TimeoutElapsed, TokioTimeDriver};
+use futures_util::task::{ArcWake, waker};
+use policy_gate::{TimeDriver, TimeoutElapsed};
 
-#[derive(Clone, Copy)]
-struct ImmediateTimeDriver;
+#[path = "support/time.rs"]
+mod time;
+use time::TestTimeDriver;
 
-impl TimeDriver for ImmediateTimeDriver {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
+#[derive(Default)]
+struct WakeCounter(AtomicUsize);
 
-    fn sleep_until(&self, _deadline: Instant) -> impl Future<Output = ()> + Send {
-        ready(())
-    }
-
-    fn yield_now(&self) -> impl Future<Output = ()> + Send {
-        ready(())
+impl ArcWake for WakeCounter {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.fetch_add(1, Ordering::AcqRel);
     }
 }
 
-#[test]
-fn custom_drivers_are_statically_dispatched_and_timeouts_win_ties() {
-    let driver = ImmediateTimeDriver;
+#[tokio::test]
+async fn timeout_wins_when_operation_and_deadline_become_ready_together() {
+    let driver = TestTimeDriver::default();
     let deadline = driver.now() + Duration::from_secs(1);
-    let result = driver
-        .timeout_at(deadline, ready(42))
-        .now_or_never()
-        .expect("the immediate driver completes synchronously");
+    let operation_driver = driver.clone();
+    let timeout_driver = driver.clone();
+    let result = tokio::spawn(async move {
+        timeout_driver
+            .timeout_at(deadline, operation_driver.sleep_until(deadline))
+            .await
+    });
+    tokio::task::yield_now().await;
 
-    assert_eq!(result, Err(TimeoutElapsed));
-    assert_eq!(core::mem::size_of::<TokioTimeDriver>(), 0);
+    driver.advance(Duration::from_millis(999)).await;
+    assert!(!result.is_finished());
+    driver.advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        result.await.expect("timeout task joins"),
+        Err(TimeoutElapsed)
+    );
+}
+
+#[tokio::test]
+async fn dropping_sleep_removes_its_waker() {
+    let driver = TestTimeDriver::default();
+    let wake_counter = Arc::new(WakeCounter::default());
+    let task_waker = waker(Arc::clone(&wake_counter));
+    let mut cancelled_context = Context::from_waker(&task_waker);
+    let mut cancelled = Box::pin(driver.sleep_until(driver.now() + Duration::from_secs(1)));
+    assert_eq!(
+        Pin::new(&mut cancelled).poll(&mut cancelled_context),
+        Poll::Pending
+    );
+
+    drop(cancelled);
+    driver.advance(Duration::from_secs(1)).await;
+
+    assert_eq!(wake_counter.0.load(Ordering::Acquire), 0);
 }

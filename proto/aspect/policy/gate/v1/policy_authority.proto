@@ -2,14 +2,6 @@
 
 syntax = "proto3";
 
-// Wire contract between a policy gate and the authority that owns its decisions.
-//
-// The authority is the only source of truth. A gate caches what the authority told it
-// and never infers a decision of its own.
-//
-// Every RPC names a scope: one opaque policy domain whose name clients and the
-// authority agree on out of band. A client binds to exactly one scope and sends that
-// same name on every request.
 package aspect.policy.gate.v1;
 
 // Serves the decision in force for each subject in a scope, and the later changes to it.

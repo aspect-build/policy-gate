@@ -281,10 +281,9 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
 
     /// Returns a cached authoritative admission without waiting or issuing I/O.
     ///
-    /// This is the fast path: one snapshot read, suitable for every request. `None` means the
-    /// snapshot cannot answer — the subject is unknown, its verdict is still being fetched, its
-    /// cached state went stale, or the watch is down — and the caller should fall back to
-    /// [`PolicyGate::admit`].
+    /// This is the cached path and performs no I/O. `None` means the snapshot cannot answer — the
+    /// subject is unknown, its verdict is still being fetched, its cached state went stale, or the
+    /// watch is down — and the caller should fall back to [`PolicyGate::admit`].
     #[must_use]
     pub fn try_cached(&self, subject: &T) -> Option<Admission> {
         self.state.check(subject)
@@ -319,8 +318,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
     }
 
     #[cfg(feature = "tower-layer")]
-    pub(crate) fn now(&self) -> Instant {
-        self.state.time.now()
+    pub(crate) async fn admit_after(
+        &self,
+        subject: T,
+        delay: Duration,
+    ) -> Result<Admission, AdmissionUnavailable> {
+        self.state.time.sleep(delay).await;
+        self.admit(subject).await
     }
 }
 
@@ -532,19 +536,28 @@ impl<T: Subject> SubjectMap<T> {
         entry
     }
 
-    fn get(&self, subject: &T, now: Instant) -> Option<TriompheArc<Entry>> {
+    fn touch(&self, subject: &T, entry: &Entry, now: Instant) {
         let tick = self.tick(now);
         let mut entries = self.entries.lock();
-        let entry = entries.get_mut(subject).map(|slot| {
+        if entries
+            .peek(subject)
+            .is_some_and(|slot| core::ptr::eq::<Entry>(slot.entry.as_ref(), entry))
+        {
+            let slot = entries
+                .get_mut(subject)
+                .expect("the matching entry remains present while the map is locked");
             slot.entry.touch(tick);
-            TriompheArc::clone(&slot.entry)
-        });
+        }
         self.evict(&mut entries, tick);
-        entry
     }
 
-    fn touch(&self, entry: &Entry, now: Instant) {
-        entry.touch(self.tick(now));
+    fn peek(&self, subject: &T, now: Instant) -> Option<TriompheArc<Entry>> {
+        let tick = self.tick(now);
+        let mut entries = self.entries.lock();
+        self.evict(&mut entries, tick);
+        entries
+            .peek(subject)
+            .map(|slot| TriompheArc::clone(&slot.entry))
     }
 
     fn remove(&self, subject: &T, now: Instant) -> bool {
@@ -623,7 +636,7 @@ struct PublishState {
     next_allowed: Instant,
 }
 
-/// Owns authoritative subject state and its lock-free read snapshot.
+/// Owns authoritative subject state and its cached read snapshot.
 pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> {
     client: Arc<C>,
     time: D,
@@ -703,13 +716,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         self.time.clone()
     }
 
-    /// Reads subject state through the lock-free snapshot.
+    /// Reads subject state through the snapshot and records its map recency.
     pub(crate) fn check(&self, subject: &T) -> Option<Admission> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
         // Pending and stale entries read as snapshot misses.
         entry.verdict()?;
-        self.subjects.touch(entry, self.time.now());
+        self.subjects.touch(subject, entry, self.time.now());
         Entry::admission(TriompheArc::clone(entry))
     }
 
@@ -1022,7 +1035,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         let subject = &change.subject;
         // Absent subjects are ignored: a vanished entry is re-admitted by its stream or next request.
         if let Some(verdict) = decode_decision(change.decision) {
-            let entry = self.subjects.get(subject, self.time.now());
+            let entry = self.subjects.peek(subject, self.time.now());
             self.republish_if_due();
             if let Some(entry) = entry {
                 let next = verdict.into();
@@ -1094,13 +1107,14 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 }
 
-impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> GateState<T, C, M, D> {
+impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> GateState<T, C, M, D> {
     /// Stops new admissions before shutdown tears down the watch.
     pub(crate) fn watch_stopping(&self) {
         self.stopping.store(true, Ordering::Release);
         self.publish_empty(|| {
             self.connected.send(false);
             self.metrics.set_watch_connected(false);
+            self.mark_disconnected();
         });
         self.subjects.clear();
     }

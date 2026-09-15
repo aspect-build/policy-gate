@@ -40,6 +40,17 @@ match gate.admit("organization-123".to_owned()).await? {
 The default feature set enables Tokio scheduling and the tonic decision source. Enable only the
 runtime and transport adapters a service uses; use `default-features = false` for the core gate.
 
+## HTTP middleware example
+
+[`examples/http_middleware.rs`](examples/http_middleware.rs) shows an Axum service with two
+separate middleware stages: authentication validates a bearer token and inserts a trusted subject
+into request extensions, then `PolicyGateLayer` admits that subject and observes later policy
+changes. Run it with:
+
+```shell
+cargo run --example http_middleware --features axum-body
+```
+
 ## Runtime contract
 
 The `DecisionWatcher` returned by `PolicyGate::new` must be continuously polled. Dropping it stops new
