@@ -26,7 +26,8 @@
 //! Absolute decision freshness is opt-in. A finite freshness TTL enables it; the default
 //! [`DEFAULT_DECISION_FRESHNESS_TTL`] sentinel never expires. When enabled, ordinary cache access
 //! never extends a decision's deadline. Handles and admissions check expiry on access; stream bodies
-//! cut off expired decisions on their next poll. Time alone never wakes an idle stream.
+//! cut off expired decisions on their next poll. An optional refresh-ahead setting proactively
+//! refreshes subjects with live allowed admissions. Time alone never wakes an idle stream.
 //! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
 //!
 //! # Example
@@ -321,6 +322,7 @@ pub struct PolicyGateConfig {
     max_subjects: usize,
     subject_ttl: Duration,
     decision_freshness_ttl: Duration,
+    decision_refresh_ahead: Option<Duration>,
 }
 
 impl PolicyGateConfig {
@@ -341,6 +343,7 @@ impl PolicyGateConfig {
                 max_subjects: DEFAULT_MAX_SUBJECTS,
                 subject_ttl: DEFAULT_SUBJECT_TTL,
                 decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
+                decision_refresh_ahead: None,
             },
         }
     }
@@ -431,9 +434,20 @@ impl PolicyGateConfig {
     /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
     /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
     /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
+    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_ahead`] to refresh live allowed
+    /// admissions before this deadline.
     #[must_use]
     pub const fn decision_freshness_ttl(&self) -> Duration {
         self.decision_freshness_ttl
+    }
+
+    /// How long before freshness expiry a subject with a live allowed admission is refreshed.
+    ///
+    /// `None` disables proactive refresh while allowing absolute expiry to remain enabled. A value
+    /// requires a finite [`PolicyGateConfig::decision_freshness_ttl`].
+    #[must_use]
+    pub const fn decision_refresh_ahead(&self) -> Option<Duration> {
+        self.decision_refresh_ahead
     }
 }
 
@@ -539,6 +553,16 @@ impl PolicyGateConfigBuilder {
         self
     }
 
+    /// Sets how long before decision freshness expiry a live allowed admission triggers a refresh.
+    ///
+    /// This requires a finite [`PolicyGateConfigBuilder::decision_freshness_ttl`] and must be
+    /// strictly less than that TTL.
+    #[must_use]
+    pub const fn decision_refresh_ahead(mut self, refresh_ahead: Duration) -> Self {
+        self.candidate.decision_refresh_ahead = Some(refresh_ahead);
+        self
+    }
+
     /// Normalizes fields and checks cross-field rules.
     ///
     /// # Errors
@@ -604,6 +628,17 @@ impl PolicyGateConfigBuilder {
         {
             return Err(ConfigError::DurationOverflow("decision freshness TTL"));
         }
+        match candidate.decision_refresh_ahead {
+            None => {}
+            Some(_) if candidate.decision_freshness_ttl == DEFAULT_DECISION_FRESHNESS_TTL => {
+                return Err(ConfigError::DecisionFreshnessIncomplete);
+            }
+            Some(refresh_ahead) if refresh_ahead.is_zero() => {
+                return Err(ConfigError::DecisionRefreshAheadZero);
+            }
+            Some(refresh_ahead) if refresh_ahead < candidate.decision_freshness_ttl => {}
+            Some(_) => return Err(ConfigError::DecisionRefreshAheadNotLessThanTtl),
+        }
         Ok(candidate)
     }
 }
@@ -631,6 +666,12 @@ pub enum ConfigError {
     MaxSubjectsZero,
     /// A zero freshness TTL would make every authoritative decision immediately unusable.
     DecisionFreshnessTtlZero,
+    /// Refresh-ahead was configured while absolute freshness remained disabled.
+    DecisionFreshnessIncomplete,
+    /// A zero refresh-ahead interval would refresh at the freshness deadline.
+    DecisionRefreshAheadZero,
+    /// Refresh-ahead must leave a nonzero authoritative window before expiry.
+    DecisionRefreshAheadNotLessThanTtl,
 }
 
 impl fmt::Display for ConfigError {
@@ -663,6 +704,15 @@ impl fmt::Display for ConfigError {
             Self::MaxSubjectsZero => f.write_str("maximum subject count must be greater than zero"),
             Self::DecisionFreshnessTtlZero => {
                 f.write_str("decision freshness TTL must be greater than zero")
+            }
+            Self::DecisionFreshnessIncomplete => {
+                f.write_str("decision refresh-ahead requires a finite freshness TTL")
+            }
+            Self::DecisionRefreshAheadZero => {
+                f.write_str("decision refresh-ahead must be greater than zero")
+            }
+            Self::DecisionRefreshAheadNotLessThanTtl => {
+                f.write_str("decision refresh-ahead must be less than the freshness TTL")
             }
         }
     }

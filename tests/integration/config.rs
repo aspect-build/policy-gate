@@ -51,6 +51,7 @@ fn builder_uses_public_defaults() {
         defaults.decision_freshness_ttl(),
         DEFAULT_DECISION_FRESHNESS_TTL
     );
+    assert_eq!(defaults.decision_refresh_ahead(), None);
 }
 
 #[test]
@@ -168,5 +169,44 @@ fn decision_freshness_ttl_must_be_positive() {
     assert_config_error(
         config().decision_freshness_ttl(Duration::ZERO),
         ConfigError::DecisionFreshnessTtlZero,
+    );
+}
+
+#[test]
+fn decision_freshness_ttl_remains_valid_without_refresh_ahead() {
+    let configured = config()
+        .decision_freshness_ttl(Duration::from_secs(30))
+        .build()
+        .expect("freshness TTL alone remains valid");
+    assert_eq!(configured.decision_refresh_ahead(), None);
+}
+
+#[test]
+fn decision_refresh_ahead_requires_a_finite_freshness_ttl() {
+    assert_config_error(
+        config().decision_refresh_ahead(Duration::from_secs(5)),
+        ConfigError::DecisionFreshnessIncomplete,
+    );
+}
+
+#[test]
+fn decision_refresh_ahead_must_be_less_than_freshness_ttl() {
+    for invalid in [Duration::from_secs(30), Duration::from_secs(31)] {
+        assert_config_error(
+            config()
+                .decision_freshness_ttl(Duration::from_secs(30))
+                .decision_refresh_ahead(invalid),
+            ConfigError::DecisionRefreshAheadNotLessThanTtl,
+        );
+    }
+}
+
+#[test]
+fn decision_refresh_ahead_must_be_positive() {
+    assert_config_error(
+        config()
+            .decision_freshness_ttl(Duration::from_secs(30))
+            .decision_refresh_ahead(Duration::ZERO),
+        ConfigError::DecisionRefreshAheadZero,
     );
 }
