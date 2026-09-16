@@ -1124,25 +1124,20 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         entry: &Arc<Entry>,
     ) -> Option<Admission<D>> {
         let admission = Entry::admission(Arc::clone(entry))?;
-        self.refresh_on_access(subject, entry);
-        Some(admission)
-    }
-
-    fn refresh_on_access(self: &Arc<Self>, subject: &T, entry: &Arc<Entry>) {
-        let Some(current) =
+        if let Some(current) =
             entry.refresh_if_due(D::now(), self.config.decision_refresh_before_expiry())
-        else {
-            return;
-        };
-        let refresh =
-            self.new_fetch_after(Arc::downgrade(entry), subject.clone(), None, Some(current));
-        if !entry.install_pending(Arc::clone(&refresh)) {
-            refresh.abort();
-            return;
+        {
+            let refresh =
+                self.new_fetch_after(Arc::downgrade(entry), subject.clone(), None, Some(current));
+            if entry.install_pending(Arc::clone(&refresh)) {
+                if self.refreshes.unbounded_send(refresh.future()).is_err() {
+                    entry.abort_pending();
+                }
+            } else {
+                refresh.abort();
+            }
         }
-        if self.refreshes.unbounded_send(refresh.future()).is_err() {
-            entry.abort_pending();
-        }
+        Some(admission)
     }
 
     /// Marks the watch connected after clearing state from the prior connection.
