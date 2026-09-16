@@ -64,13 +64,15 @@ concurrent calls for the same subject join one in-flight authority lookup.
 ## Decision freshness
 
 `subject_ttl` remains a sliding idle-cache eviction policy. Absolute decision freshness is a
-separate opt-in safeguard configured with a finite freshness TTL.
+separate opt-in safeguard configured with a finite freshness TTL. A refresh age shorter than that
+TTL can additionally refresh cached decisions on access before expiry.
 
 ```rust
 # use core::time::Duration;
 # use policy_gate::PolicyGateConfig;
 let config = PolicyGateConfig::builder()
     .decision_freshness_ttl(Duration::from_secs(60))
+    .decision_refresh_after(Duration::from_secs(50))
     .build()?;
 # Ok::<(), policy_gate::ConfigError>(())
 ```
@@ -78,13 +80,18 @@ let config = PolicyGateConfig::builder()
 Admission handles carry the gate's concrete time driver as `Admission<D>` (defaulting to
 `TokioTimeDriver`). Clock calls are statically dispatched; entries store no driver or clock callback.
 
-The freshness deadline starts when a lookup completes or an authoritative watch change arrives;
+The freshness deadline starts when a lookup completes, a proactive refresh completes, or an
+authoritative watch change arrives;
 ordinary cache access does not extend it. `Admission::is_allowed()` returns false for denied,
 stale, or expired decisions; `state()` reports expiration as `Stale`. Admission refetches an expired
 cached decision. Request and response stream bodies cut off on their next poll after expiration,
-before delivering more traffic. An entirely idle stream stays idle: there is no expiration timer,
-background scan, or authority-change observer. A new watch decision installs a new absolute deadline;
-watch disconnects and eviction retain their existing stale/readmission recovery behavior. The default
+before delivering more traffic. With the default `Duration::MAX` refresh age, an entirely idle
+stream stays idle: there is no expiration timer, background scan, or authority-change observer.
+With a finite refresh age, the first cache read after that age starts one background lookup.
+Concurrent reads join that in-flight refresh. A failed refresh does not extend the deadline and may
+be retried by a later read. An in-flight refresh cannot revive a decision after expiry or supersede
+a newer watch update. A new watch decision installs a new absolute deadline; watch disconnects and
+eviction retain their existing stale/readmission recovery behavior. The default
 `DEFAULT_DECISION_FRESHNESS_TTL` is exactly `Duration::MAX`, a never-expire sentinel that is not
-converted into an `Instant`. This keeps freshness disabled by default,
-so existing users retain the original request and unary-call behavior.
+converted into an `Instant`. Freshness and background refresh are disabled by default, so existing
+users retain the original request and unary-call behavior.

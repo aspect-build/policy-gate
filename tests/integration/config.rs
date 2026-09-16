@@ -4,11 +4,12 @@ use core::time::Duration;
 
 use policy_gate::{
     ConfigError, DEFAULT_ADMISSION_TIMEOUT, DEFAULT_DECISION_FRESHNESS_TTL,
-    DEFAULT_INITIAL_ADMISSION_RETRY_DELAY, DEFAULT_INITIAL_RECONNECT_DELAY,
-    DEFAULT_MAX_ADMISSION_RETRY_DELAY, DEFAULT_MAX_RECONNECT_DELAY, DEFAULT_MAX_SUBJECTS,
-    DEFAULT_PERMANENT_FAILURE_COOLDOWN, DEFAULT_SNAPSHOT_REPUBLISH_INTERVAL, DEFAULT_SUBJECT_TTL,
-    DEFAULT_UNARY_TIMEOUT, DEFAULT_WATCH_EVENTS_PER_YIELD, DecisionWatcher, PolicyGateConfig,
-    PolicyGateConfigBuilder, PolicyGateLayerConfig, Subject,
+    DEFAULT_DECISION_REFRESH_AFTER, DEFAULT_INITIAL_ADMISSION_RETRY_DELAY,
+    DEFAULT_INITIAL_RECONNECT_DELAY, DEFAULT_MAX_ADMISSION_RETRY_DELAY,
+    DEFAULT_MAX_RECONNECT_DELAY, DEFAULT_MAX_SUBJECTS, DEFAULT_PERMANENT_FAILURE_COOLDOWN,
+    DEFAULT_SNAPSHOT_REPUBLISH_INTERVAL, DEFAULT_SUBJECT_TTL, DEFAULT_UNARY_TIMEOUT,
+    DEFAULT_WATCH_EVENTS_PER_YIELD, DecisionWatcher, PolicyGateConfig, PolicyGateConfigBuilder,
+    PolicyGateLayerConfig, Subject,
 };
 
 const fn config() -> PolicyGateConfigBuilder {
@@ -50,6 +51,10 @@ fn builder_uses_public_defaults() {
     assert_eq!(
         defaults.decision_freshness_ttl(),
         DEFAULT_DECISION_FRESHNESS_TTL
+    );
+    assert_eq!(
+        defaults.decision_refresh_after(),
+        DEFAULT_DECISION_REFRESH_AFTER
     );
 }
 
@@ -168,5 +173,47 @@ fn decision_freshness_ttl_must_be_positive() {
     assert_config_error(
         config().decision_freshness_ttl(Duration::ZERO),
         ConfigError::DecisionFreshnessTtlZero,
+    );
+}
+
+#[test]
+fn decision_freshness_ttl_remains_valid_without_background_refresh() {
+    let configured = config()
+        .decision_freshness_ttl(Duration::from_secs(30))
+        .build()
+        .expect("freshness TTL alone remains valid");
+    assert_eq!(
+        configured.decision_refresh_after(),
+        DEFAULT_DECISION_REFRESH_AFTER
+    );
+}
+
+#[test]
+fn decision_refresh_after_requires_a_finite_freshness_ttl() {
+    assert_config_error(
+        config().decision_refresh_after(Duration::from_secs(5)),
+        ConfigError::DecisionRefreshAfterRequiresFiniteTtl,
+    );
+}
+
+#[test]
+fn decision_refresh_after_must_be_less_than_freshness_ttl() {
+    for invalid in [Duration::from_secs(30), Duration::from_secs(31)] {
+        assert_config_error(
+            config()
+                .decision_freshness_ttl(Duration::from_secs(30))
+                .decision_refresh_after(invalid),
+            ConfigError::DecisionRefreshAfterNotLessThanTtl,
+        );
+    }
+}
+
+#[test]
+fn decision_refresh_after_must_be_positive() {
+    assert_config_error(
+        config()
+            .decision_freshness_ttl(Duration::from_secs(30))
+            .decision_refresh_after(Duration::ZERO),
+        ConfigError::DecisionRefreshAfterZero,
     );
 }

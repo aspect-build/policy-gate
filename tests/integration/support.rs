@@ -362,6 +362,7 @@ pub(crate) struct ConfigOptions {
     pub(crate) max_subjects: usize,
     pub(crate) subject_ttl: Duration,
     pub(crate) decision_freshness_ttl: Duration,
+    pub(crate) decision_refresh_after: Duration,
 }
 
 impl Default for ConfigOptions {
@@ -379,6 +380,7 @@ impl Default for ConfigOptions {
             max_subjects: 65_536,
             subject_ttl: Duration::from_secs(3_600),
             decision_freshness_ttl: Duration::MAX,
+            decision_refresh_after: Duration::MAX,
         }
     }
 }
@@ -397,6 +399,7 @@ pub(crate) fn validated(options: &ConfigOptions) -> PolicyGateConfig {
         .max_subjects(options.max_subjects)
         .subject_ttl(options.subject_ttl)
         .decision_freshness_ttl(options.decision_freshness_ttl)
+        .decision_refresh_after(options.decision_refresh_after)
         .build()
         .expect("test config must validate")
 }

@@ -9,13 +9,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_watch::Sender;
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use rand::RngCore;
 
 use crate::DecisionSourceErrorKind;
-use crate::gate::{DecisionSource, GateState, Subject};
+use crate::gate::{DecisionRefreshFuture, DecisionSource, GateState, Subject};
 use crate::metrics::PolicyGateMetrics;
 use crate::time::{TimeDriver, TokioTimeDriver};
 
@@ -71,7 +73,8 @@ impl<D: TimeDriver> DecisionSourceHealth<D> {
 ///
 /// The watcher is a future that never completes: it keeps the decision source's change stream
 /// open, applies each change to the gate's cache, and reopens the stream with jittered backoff
-/// after any failure. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
+/// after any failure. It also runs refreshes requested by cache reads. Poll it for the lifetime of
+/// the gate, normally with `tokio::spawn`.
 ///
 /// Unary lookups and cache maintenance also mutate gate state, but only the watcher can supply or
 /// refresh an authoritative verdict, so its progress is a hard requirement rather than an
@@ -101,6 +104,7 @@ impl DecisionWatcher {
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
+        refresh_requests: UnboundedReceiver<DecisionRefreshFuture>,
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
@@ -114,7 +118,7 @@ impl DecisionWatcher {
             _time: PhantomData,
         });
         let lease = WatchLease { state, connected };
-        let future = watch_source(lease, client, metrics).boxed();
+        let future = watch_source(lease, client, metrics, refresh_requests).boxed();
         (Self { future }, health)
     }
 }
@@ -144,6 +148,7 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
     lease: WatchLease<T, C, M, D>,
     client: Arc<C>,
     metrics: M,
+    mut refresh_requests: UnboundedReceiver<DecisionRefreshFuture>,
 ) {
     let initial_reconnect_delay = lease.state.initial_reconnect_delay();
     let max_reconnect_delay = lease.state.max_reconnect_delay();
@@ -158,40 +163,17 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         match opened {
             Ok(Ok(stream)) => {
                 lease.state.watch_connected(&lease.connected);
-                let stream = stream.fuse();
-                let stable_timer = D::sleep(max_reconnect_delay).fuse();
-                futures_util::pin_mut!(stream, stable_timer);
-                let mut events_since_yield = 0;
-                loop {
-                    let item = futures_util::select! {
-                        () = stable_timer => {
-                            // Health recovery and backoff reset share the same stability threshold.
-                            reconnect_delay = initial_reconnect_delay;
-                            lease.state.watch_stable();
-                            continue;
-                        },
-                        item = stream.next() => item,
-                    };
-                    let Some(item) = item else {
-                        break;
-                    };
-                    let change = match item {
-                        Ok(change) => change,
-                        Err(error) => {
-                            if error.kind() == DecisionSourceErrorKind::Wire {
-                                metrics.wire_failure();
-                            }
-                            tracing::warn!(?error, "policy authority watch failed");
-                            break;
-                        }
-                    };
-                    lease.state.apply_change(&change);
-                    metrics.watch_event();
-                    events_since_yield += 1;
-                    if events_since_yield == watch_events_per_yield {
-                        events_since_yield = 0;
-                        D::yield_now().await;
-                    }
+                let stable = watch_connected::<T, C, M, D>(
+                    Arc::clone(&lease.state),
+                    stream,
+                    metrics,
+                    max_reconnect_delay,
+                    watch_events_per_yield,
+                    &mut refresh_requests,
+                )
+                .await;
+                if stable {
+                    reconnect_delay = initial_reconnect_delay;
                 }
                 metrics.watch_disconnect();
             }
@@ -211,6 +193,80 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         lease.state.watch_disconnected(&lease.connected);
         D::sleep(jitter(reconnect_delay)).await;
         reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+    }
+}
+
+async fn watch_connected<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver>(
+    state: Arc<GateState<T, C, M, D>>,
+    stream: C::Changes,
+    metrics: M,
+    stability_delay: Duration,
+    work_per_yield: usize,
+    refresh_requests: &mut UnboundedReceiver<DecisionRefreshFuture>,
+) -> bool {
+    let stream = stream.fuse();
+    let stable_timer = D::sleep(stability_delay).fuse();
+    let mut refreshes = FuturesUnordered::new();
+    futures_util::pin_mut!(stream, stable_timer);
+    let mut stable = false;
+    let mut work_since_yield = 0;
+    loop {
+        let refresh_request = refresh_requests.next().fuse();
+        let refresh = refreshes.select_next_some();
+        futures_util::pin_mut!(refresh_request, refresh);
+        let item = futures_util::select! {
+            () = stable_timer => {
+                stable = true;
+                state.watch_stable();
+                continue;
+            },
+            request = refresh_request => {
+                if let Some(request) = request {
+                    refreshes.push(request);
+                }
+                work_since_yield += 1;
+                if work_since_yield == work_per_yield {
+                    work_since_yield = 0;
+                    D::yield_now().await;
+                }
+                continue;
+            },
+            () = refresh => {
+                work_since_yield += 1;
+                if work_since_yield == work_per_yield {
+                    work_since_yield = 0;
+                    D::yield_now().await;
+                }
+                continue;
+            },
+            item = stream.next() => item,
+        };
+        let Some(change) = decode_watch_item(item, metrics) else {
+            return stable;
+        };
+        state.apply_change(&change);
+        metrics.watch_event();
+        work_since_yield += 1;
+        if work_since_yield == work_per_yield {
+            work_since_yield = 0;
+            D::yield_now().await;
+        }
+    }
+}
+
+fn decode_watch_item<T: Subject, M: PolicyGateMetrics>(
+    item: Option<Result<crate::DecisionChange<T>, crate::DecisionSourceError>>,
+    metrics: M,
+) -> Option<crate::DecisionChange<T>> {
+    match item? {
+        Ok(change) => Some(change),
+        Err(error) => {
+            if error.kind() == DecisionSourceErrorKind::Wire {
+                metrics.wire_failure();
+            }
+            tracing::warn!(?error, "policy authority watch failed");
+            None
+        }
     }
 }
 
