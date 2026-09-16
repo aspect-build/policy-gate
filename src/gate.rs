@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_watch::{Receiver, Sender};
+use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use futures_util::FutureExt;
 use futures_util::future::{AbortHandle, Abortable, Aborted, BoxFuture, Shared};
@@ -40,8 +41,8 @@ impl<T> Subject for T where T: Clone + Eq + Hash + Send + Sync + 'static {}
 ///
 /// Both methods are called from the gate's own tasks and must not block the async runtime. The
 /// gate applies [`PolicyGateConfig::unary_timeout`](crate::PolicyGateConfig::unary_timeout) to
-/// every lookup and reopens the watch with backoff, so an implementation needs no timeout or
-/// retry logic of its own. It does need to classify failures: the
+/// every admission or refresh lookup and reopens the watch with backoff, so an implementation
+/// needs no timeout or retry logic of its own. It does need to classify failures: the
 /// [`kind`](DecisionSourceError::kind) of a returned error decides whether the gate retries the
 /// call, fails admission, or counts a protocol violation.
 pub trait DecisionSource<T: Subject>: Send + Sync + 'static {
@@ -247,9 +248,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
         time: D,
     ) -> crate::PolicyGateParts<T, C, M, D> {
         let (connected, connectivity) = async_watch::channel(false);
-        let state = GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
+        let (state, refreshes) =
+            GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
         let (watcher, health) =
-            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected);
+            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected, refreshes);
         (Self { state, metrics }, watcher, health)
     }
 
@@ -330,7 +332,7 @@ pub(crate) enum Observed {
 
 type FetchResult = Result<Decision, DecisionSourceError>;
 type Generation = triomphe::Arc<()>;
-type PendingFuture = Shared<BoxFuture<'static, Result<FetchResult, Aborted>>>;
+pub(crate) type PendingFuture = Shared<BoxFuture<'static, Result<FetchResult, Aborted>>>;
 
 struct PendingFetch {
     generation: Generation,
@@ -472,6 +474,26 @@ impl Entry {
         deadline != NO_EXPIRY && self.tick(now) >= deadline
     }
 
+    fn refresh_if_due(&self, now: Instant, refresh_before: Duration) -> Option<u64> {
+        if refresh_before.is_zero() {
+            return None;
+        }
+        let decision = self.current.load(Ordering::Acquire);
+        if !matches!(
+            decode_entry_state(decision),
+            EntryState::Allowed | EntryState::Denied
+        ) {
+            return None;
+        }
+        let deadline = decision >> 2;
+        let now = self.tick(now);
+        let refresh_before = u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX);
+        if deadline == NO_EXPIRY || now >= deadline || deadline - now > refresh_before {
+            return None;
+        }
+        Some(decision)
+    }
+
     fn pending_operation(&self) -> Option<Arc<PendingFetch>> {
         self.pending.load_full()
     }
@@ -484,6 +506,12 @@ impl Entry {
     fn pending_is(&self, pending: &Arc<PendingFetch>) -> bool {
         self.pending_operation()
             .is_some_and(|current| Arc::ptr_eq(&current, pending))
+    }
+
+    fn install_pending(&self, pending: Arc<PendingFetch>) -> bool {
+        self.pending
+            .compare_and_swap(&None::<Arc<PendingFetch>>, Some(pending))
+            .is_none()
     }
 
     fn replace_pending(
@@ -709,6 +737,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
+    refreshes: UnboundedSender<PendingFuture>,
     config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
@@ -732,10 +761,11 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         metrics: M,
         _time: D,
         connected: Receiver<bool>,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, UnboundedReceiver<PendingFuture>) {
         let now = D::now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
-        Arc::new(Self {
+        let (refreshes, refresh_requests) = futures_channel::mpsc::unbounded();
+        let state = Arc::new(Self {
             client,
             connected,
             disconnected_since: Arc::new(Mutex::new(Some(now))),
@@ -751,10 +781,12 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 next_allowed: now,
             }),
             shape_dirty,
+            refreshes,
             config: *config,
             metrics,
             _time: PhantomData,
-        })
+        });
+        (state, refresh_requests)
     }
 
     /// Returns the total admission time budget.
@@ -783,13 +815,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 
     /// Reads subject state through the snapshot and records its map recency.
-    pub(crate) fn check(&self, subject: &T) -> Option<Admission<D>> {
+    pub(crate) fn check(self: &Arc<Self>, subject: &T) -> Option<Admission<D>> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
         // Pending and stale entries read as snapshot misses.
         entry.verdict_at(D::now())?;
         self.subjects.touch(subject, entry, D::now());
-        Entry::admission(Arc::clone(entry))
+        self.admission_on_access(subject, entry)
     }
 
     /// Resolves an authoritative subject verdict within the admission budget.
@@ -828,7 +860,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 Arc::new_cyclic(|entry| {
                     Entry::pending(
                         now,
-                        self.new_fetch_after(entry.clone(), subject.clone(), None),
+                        self.new_fetch_after(entry.clone(), subject.clone(), None, None),
                     )
                 })
             });
@@ -856,7 +888,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             let pending = match entry.state_at(D::now()) {
                 EntryState::Allowed | EntryState::Denied => {
                     self.metrics.map_hit();
-                    if let Some(admission) = Entry::admission(entry) {
+                    if let Some(admission) = self.admission_on_access(subject, &entry) {
                         return Some(admission);
                     }
                     continue;
@@ -904,7 +936,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 Ok(Some(Err(Aborted)) | None) => continue,
                 Err(_) => {
                     // An authoritative transition may race the deadline notification.
-                    if let Some(admission) = Entry::admission(entry) {
+                    if let Some(admission) = self.admission_on_access(subject, &entry) {
                         return Some(admission);
                     }
                     return self.admission_timed_out();
@@ -915,7 +947,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             }
             match entry.state_at(D::now()) {
                 EntryState::Allowed | EntryState::Denied => {
-                    if let Some(admission) = Entry::admission(entry) {
+                    if let Some(admission) = self.admission_on_access(subject, &entry) {
                         return Some(admission);
                     }
                     continue;
@@ -948,6 +980,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         entry: Weak<Entry>,
         subject: T,
         delay: Option<Duration>,
+        refresh_from: Option<u64>,
     ) -> Arc<PendingFetch> {
         // `delay` is the permanent-failure cooldown; it starts when the first joiner polls.
         let client = Arc::clone(&self.client);
@@ -990,7 +1023,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                     metrics.unary_failure();
                 }
                 if let (Some(gate), Some(entry)) = (gate.upgrade(), entry.upgrade()) {
-                    gate.apply_fetch_result(&subject, &entry, &completion_generation, &result);
+                    gate.apply_fetch_result(
+                        &subject,
+                        &entry,
+                        &completion_generation,
+                        refresh_from,
+                        &result,
+                    );
                 }
                 result
             },
@@ -1010,9 +1049,24 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         subject: &T,
         entry: &Arc<Entry>,
         generation: &Generation,
+        refresh_from: Option<u64>,
         result: &FetchResult,
     ) {
         if entry.pending_generation(generation).is_none() {
+            return;
+        }
+        if let Some(current) = refresh_from {
+            if let Ok(decision) = result
+                && !entry.is_expired_at(current, D::now())
+            {
+                let _ = entry.current.compare_exchange(
+                    current,
+                    Entry::word((*decision).into(), self.decision_deadline(entry)),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            entry.replace_pending(generation, None);
             return;
         }
         if let Ok(decision) = result {
@@ -1036,6 +1090,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                     Arc::downgrade(entry),
                     subject.clone(),
                     Some(self.config.permanent_failure_cooldown()),
+                    None,
                 );
                 entry.replace_pending(generation, Some(retry));
             }
@@ -1061,6 +1116,33 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     fn admission_timed_out(&self) -> Option<Admission<D>> {
         self.metrics.admission_timeout();
         None
+    }
+
+    fn admission_on_access(
+        self: &Arc<Self>,
+        subject: &T,
+        entry: &Arc<Entry>,
+    ) -> Option<Admission<D>> {
+        let admission = Entry::admission(Arc::clone(entry))?;
+        self.refresh_on_access(subject, entry);
+        Some(admission)
+    }
+
+    fn refresh_on_access(self: &Arc<Self>, subject: &T, entry: &Arc<Entry>) {
+        let Some(current) =
+            entry.refresh_if_due(D::now(), self.config.decision_refresh_before_expiry())
+        else {
+            return;
+        };
+        let refresh =
+            self.new_fetch_after(Arc::downgrade(entry), subject.clone(), None, Some(current));
+        if !entry.install_pending(Arc::clone(&refresh)) {
+            refresh.abort();
+            return;
+        }
+        if self.refreshes.unbounded_send(refresh.future()).is_err() {
+            entry.abort_pending();
+        }
     }
 
     /// Marks the watch connected after clearing state from the prior connection.

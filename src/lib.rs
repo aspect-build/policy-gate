@@ -26,7 +26,9 @@
 //! Absolute decision freshness is opt-in. A finite freshness TTL enables it; the default
 //! [`DEFAULT_DECISION_FRESHNESS_TTL`] sentinel never expires. When enabled, ordinary cache access
 //! never extends a decision's deadline. Handles and admissions check expiry on access; stream bodies
-//! cut off expired decisions on their next poll. Time alone never wakes an idle stream.
+//! cut off expired decisions on their next poll. A configured refresh window starts one background
+//! refresh when a cached decision is read shortly before expiry. Time alone never wakes an idle
+//! stream.
 //! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
 //!
 //! # Example
@@ -226,6 +228,8 @@ pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(3_600);
 ///
 /// This exact value is the never-expire sentinel; the runtime does not turn it into a deadline.
 pub const DEFAULT_DECISION_FRESHNESS_TTL: Duration = Duration::MAX;
+/// Default [`PolicyGateConfigBuilder::decision_refresh_before_expiry`].
+pub const DEFAULT_DECISION_REFRESH_BEFORE_EXPIRY: Duration = Duration::ZERO;
 
 /// Authoritative decision returned for one subject.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,6 +325,7 @@ pub struct PolicyGateConfig {
     max_subjects: usize,
     subject_ttl: Duration,
     decision_freshness_ttl: Duration,
+    decision_refresh_before_expiry: Duration,
 }
 
 impl PolicyGateConfig {
@@ -341,6 +346,7 @@ impl PolicyGateConfig {
                 max_subjects: DEFAULT_MAX_SUBJECTS,
                 subject_ttl: DEFAULT_SUBJECT_TTL,
                 decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
+                decision_refresh_before_expiry: DEFAULT_DECISION_REFRESH_BEFORE_EXPIRY,
             },
         }
     }
@@ -431,9 +437,18 @@ impl PolicyGateConfig {
     /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
     /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
     /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
+    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_before_expiry`] to refresh cached
+    /// decisions on access before this deadline.
     #[must_use]
     pub const fn decision_freshness_ttl(&self) -> Duration {
         self.decision_freshness_ttl
+    }
+
+    /// Window before decision expiry in which a cached subject read starts a background refresh.
+    /// Zero disables background refresh.
+    #[must_use]
+    pub const fn decision_refresh_before_expiry(&self) -> Duration {
+        self.decision_refresh_before_expiry
     }
 }
 
@@ -536,6 +551,14 @@ impl PolicyGateConfigBuilder {
     #[must_use]
     pub const fn decision_freshness_ttl(mut self, ttl: Duration) -> Self {
         self.candidate.decision_freshness_ttl = ttl;
+        self
+    }
+
+    /// Sets the window before expiry in which a cached decision read triggers a refresh.
+    /// Zero disables background refresh.
+    #[must_use]
+    pub const fn decision_refresh_before_expiry(mut self, refresh_before: Duration) -> Self {
+        self.candidate.decision_refresh_before_expiry = refresh_before;
         self
     }
 
