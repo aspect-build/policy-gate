@@ -631,6 +631,27 @@ where
         let body = self.body;
         let response = self.response;
         Either::Right(Box::pin(async move {
+            if !refresh_disabled {
+                if let Some(admission) = context.gate.try_cached(&subject).await {
+                    if admission.is_allowed() {
+                        return pass_through(
+                            &mut inner,
+                            request,
+                            subject,
+                            admission,
+                            Arc::clone(&context),
+                            policy.as_ref(),
+                            ResponseContext { body, response },
+                        )
+                        .await;
+                    }
+                    if admission.state() == AdmissionState::Denied {
+                        return Ok(deny(&context, body, response));
+                    }
+                }
+                context.metrics.snapshot_miss();
+            }
+
             loop {
                 match context.gate.admit(&subject).await {
                     Ok(admission) if admission.is_allowed() => {

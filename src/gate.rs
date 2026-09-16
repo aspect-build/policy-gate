@@ -6,6 +6,7 @@ use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -1044,7 +1045,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                     D::sleep(delay).await;
                 }
                 metrics.unary_call();
-                let result = async {
+                let result = AssertUnwindSafe(async {
                     let decision = D::timeout(unary_timeout, client.get_subject_decision(&subject))
                         .await
                         .map_err(|_| {
@@ -1059,8 +1060,15 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                             "decision source holds no decision for the subject",
                         )
                     })
-                }
-                .await;
+                })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(DecisionSourceError::new(
+                        DecisionSourceErrorKind::Transient,
+                        "decision source panicked",
+                    ))
+                });
                 if result
                     .as_ref()
                     .is_err_and(|error| error.kind() == DecisionSourceErrorKind::Wire)
