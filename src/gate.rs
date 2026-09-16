@@ -121,7 +121,7 @@ impl<D: TimeDriver> core::fmt::Debug for Admission<D> {
 impl<D: TimeDriver> Admission<D> {
     /// Returns the current state, treating an expired decision as [`AdmissionState::Stale`].
     ///
-    /// Expiration is checked lazily: this read does not mutate the entry or start asynchronous work.
+    /// Expiration is checked lazily and atomically marks the entry stale.
     #[must_use]
     pub fn state(&self) -> AdmissionState {
         match self.observe() {
@@ -424,8 +424,8 @@ impl Entry {
     }
 
     fn state_at(&self, now: Instant) -> EntryState {
-        let decision = self.current.load(Ordering::Acquire);
-        if self.is_expired_at(decision, now) {
+        let (decision, expired) = self.current_at(now);
+        if expired {
             EntryState::Stale
         } else {
             decode_entry_state(decision)
@@ -433,8 +433,8 @@ impl Entry {
     }
 
     fn observed_at(&self, now: Instant) -> Observed {
-        let decision = self.current.load(Ordering::Acquire);
-        if self.is_expired_at(decision, now) {
+        let (decision, expired) = self.current_at(now);
+        if expired {
             return Observed::Expired;
         }
         match decode_entry_state(decision) {
@@ -448,8 +448,8 @@ impl Entry {
     }
 
     fn verdict_at(&self, now: Instant) -> Option<Decision> {
-        let decision = self.current.load(Ordering::Acquire);
-        if self.is_expired_at(decision, now) {
+        let (decision, expired) = self.current_at(now);
+        if expired {
             return None;
         }
         match decode_entry_state(decision) {
@@ -510,6 +510,29 @@ impl Entry {
     fn is_expired_at(&self, decision: u64, now: Instant) -> bool {
         let deadline = decision >> 2;
         deadline != NO_EXPIRY && self.tick(now) >= deadline
+    }
+
+    fn current_at(&self, now: Instant) -> (u64, bool) {
+        let mut current = self.current.load(Ordering::Acquire);
+        loop {
+            if !self.is_expired_at(current, now) {
+                return (current, false);
+            }
+            // A refresh CAS cannot revive the word after any observer has seen it expire.
+            let stale = (current & !STATE_MASK) | EntryState::Stale as u64;
+            if current == stale {
+                return (current, true);
+            }
+            match self.current.compare_exchange_weak(
+                current,
+                stale,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return (stale, true),
+                Err(changed) => current = changed,
+            }
+        }
     }
 
     fn pending_operation(&self) -> Option<Arc<PendingFetch>> {
@@ -655,11 +678,13 @@ impl<T: Subject> SubjectMap<T> {
         self.evict(&mut entries, tick);
     }
 
-    fn peek(&self, subject: &T, now: Instant) -> Option<Arc<Entry>> {
+    fn update(&self, subject: &T, now: Instant, update: impl FnOnce(&Arc<Entry>)) {
         let tick = self.tick(now);
         let mut entries = self.entries.lock();
         self.evict(&mut entries, tick);
-        entries.peek(subject).map(|slot| Arc::clone(&slot.entry))
+        if let Some(slot) = entries.peek(subject) {
+            update(&slot.entry);
+        }
     }
 
     fn remove(&self, subject: &T, now: Instant) -> bool {
@@ -1237,19 +1262,17 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         let subject = &change.subject;
         // Absent subjects are ignored: a vanished entry is re-admitted by its stream or next request.
         if let Some(decision) = change.decision {
-            let entry = self.subjects.peek(subject, D::now());
-            self.republish_if_due();
-            if let Some(entry) = entry {
+            self.subjects.update(subject, D::now(), |entry| {
                 let next = decision.into();
                 loop {
                     match decode_entry_state(entry.current.load(Ordering::Acquire)) {
-                        EntryState::Stale => break,
                         current @ (EntryState::Pending
                         | EntryState::Allowed
-                        | EntryState::Denied) => match entry.compare_exchange(
+                        | EntryState::Denied
+                        | EntryState::Stale) => match entry.compare_exchange(
                             current,
                             next,
-                            self.decision_deadline(&entry),
+                            self.decision_deadline(entry),
                         ) {
                             Ok(()) => {
                                 entry.abort_pending();
@@ -1264,7 +1287,8 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         },
                     }
                 }
-            }
+            });
+            self.republish_if_due();
         } else {
             let removed = self.subjects.remove(subject, D::now());
             if removed {
