@@ -560,8 +560,8 @@ impl PolicyGateConfigBuilder {
 
     /// Sets the decision age after which a cached decision read triggers a refresh.
     ///
-    /// This requires a finite [`PolicyGateConfigBuilder::decision_freshness_ttl`] and must be
-    /// strictly less than that TTL.
+    /// [`DEFAULT_DECISION_REFRESH_AFTER`] disables refresh. Any finite value must be positive and
+    /// strictly less than a finite [`PolicyGateConfigBuilder::decision_freshness_ttl`].
     #[must_use]
     pub const fn decision_refresh_after(mut self, refresh_after: Duration) -> Self {
         self.candidate.decision_refresh_after = refresh_after;
