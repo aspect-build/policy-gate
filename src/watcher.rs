@@ -10,12 +10,14 @@ use std::time::Instant;
 
 use async_watch::Sender;
 use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use rand::RngCore;
+use tokio::sync::mpsc::Receiver;
 
 use crate::DecisionSourceErrorKind;
-use crate::gate::{DecisionSource, GateState, Subject};
+use crate::gate::{DecisionSource, GateState, PendingFuture, Subject};
 use crate::metrics::PolicyGateMetrics;
 use crate::time::{TimeDriver, TokioTimeDriver};
 
@@ -71,7 +73,8 @@ impl<D: TimeDriver> DecisionSourceHealth<D> {
 ///
 /// The watcher is a future that never completes: it keeps the decision source's change stream
 /// open, applies each change to the gate's cache, and reopens the stream with jittered backoff
-/// after any failure. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
+/// after any failure. It also runs refreshes requested by cache reads. Poll it for the lifetime of
+/// the gate, normally with `tokio::spawn`.
 ///
 /// Unary lookups and cache maintenance also mutate gate state, but only the watcher can supply or
 /// refresh an authoritative verdict, so its progress is a hard requirement rather than an
@@ -101,6 +104,8 @@ impl DecisionWatcher {
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
+        refresh_rx: Receiver<PendingFuture>,
+        refresh_queue_capacity: usize,
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
@@ -114,7 +119,8 @@ impl DecisionWatcher {
             _time: PhantomData,
         });
         let lease = WatchLease { state, connected };
-        let future = watch_source(lease, client, metrics).boxed();
+        let future =
+            watch_source(lease, client, metrics, refresh_rx, refresh_queue_capacity).boxed();
         (Self { future }, health)
     }
 }
@@ -144,11 +150,21 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
     lease: WatchLease<T, C, M, D>,
     client: Arc<C>,
     metrics: M,
+    mut refresh_rx: Receiver<PendingFuture>,
+    refresh_queue_capacity: usize,
 ) {
+    enum Work<T> {
+        Stable,
+        RefreshBatch(usize),
+        RefreshDone,
+        Change(Option<Result<crate::DecisionChange<T>, crate::DecisionSourceError>>),
+    }
+
     let initial_reconnect_delay = lease.state.initial_reconnect_delay();
     let max_reconnect_delay = lease.state.max_reconnect_delay();
     let watch_events_per_yield = lease.state.watch_events_per_yield();
     let mut reconnect_delay = initial_reconnect_delay;
+    let mut refresh_buffer = Vec::with_capacity(refresh_queue_capacity);
     loop {
         let opened = D::timeout(
             lease.state.admission_timeout(),
@@ -160,17 +176,38 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
                 lease.state.watch_connected(&lease.connected);
                 let stream = stream.fuse();
                 let stable_timer = D::sleep(max_reconnect_delay).fuse();
+                let mut refreshes = FuturesUnordered::new();
                 futures_util::pin_mut!(stream, stable_timer);
                 let mut events_since_yield = 0;
                 loop {
-                    let item = futures_util::select! {
-                        () = stable_timer => {
-                            // Health recovery and backoff reset share the same stability threshold.
+                    let work = {
+                        let refresh_batch = refresh_rx
+                            .recv_many(&mut refresh_buffer, refresh_queue_capacity)
+                            .fuse();
+                        let refresh = refreshes.select_next_some();
+                        futures_util::pin_mut!(refresh_batch, refresh);
+                        futures_util::select! {
+                            () = stable_timer => Work::Stable,
+                            count = refresh_batch => Work::RefreshBatch(count),
+                            _ = refresh => Work::RefreshDone,
+                            item = stream.next() => Work::Change(item),
+                        }
+                    };
+                    let item = match work {
+                        Work::Stable => {
                             reconnect_delay = initial_reconnect_delay;
                             lease.state.watch_stable();
                             continue;
-                        },
-                        item = stream.next() => item,
+                        }
+                        Work::RefreshBatch(count) => {
+                            if count == 0 {
+                                break;
+                            }
+                            refreshes.extend(refresh_buffer.drain(..));
+                            continue;
+                        }
+                        Work::RefreshDone => continue,
+                        Work::Change(item) => item,
                     };
                     let Some(item) = item else {
                         break;

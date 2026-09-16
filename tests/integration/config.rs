@@ -6,9 +6,10 @@ use policy_gate::{
     ConfigError, DEFAULT_ADMISSION_TIMEOUT, DEFAULT_DECISION_FRESHNESS_TTL,
     DEFAULT_INITIAL_ADMISSION_RETRY_DELAY, DEFAULT_INITIAL_RECONNECT_DELAY,
     DEFAULT_MAX_ADMISSION_RETRY_DELAY, DEFAULT_MAX_RECONNECT_DELAY, DEFAULT_MAX_SUBJECTS,
-    DEFAULT_PERMANENT_FAILURE_COOLDOWN, DEFAULT_SNAPSHOT_REPUBLISH_INTERVAL, DEFAULT_SUBJECT_TTL,
-    DEFAULT_UNARY_TIMEOUT, DEFAULT_WATCH_EVENTS_PER_YIELD, DecisionWatcher, PolicyGateConfig,
-    PolicyGateConfigBuilder, PolicyGateLayerConfig, Subject,
+    DEFAULT_PERMANENT_FAILURE_COOLDOWN, DEFAULT_REFRESH_ENQUEUE_TIMEOUT,
+    DEFAULT_SNAPSHOT_REPUBLISH_INTERVAL, DEFAULT_SUBJECT_TTL, DEFAULT_UNARY_TIMEOUT,
+    DEFAULT_WATCH_EVENTS_PER_YIELD, DecisionWatcher, PolicyGateConfig, PolicyGateConfigBuilder,
+    PolicyGateLayerConfig, Subject,
 };
 
 const fn config() -> PolicyGateConfigBuilder {
@@ -50,6 +51,10 @@ fn builder_uses_public_defaults() {
     assert_eq!(
         defaults.decision_freshness_ttl(),
         DEFAULT_DECISION_FRESHNESS_TTL
+    );
+    assert_eq!(
+        defaults.refresh_enqueue_timeout(),
+        DEFAULT_REFRESH_ENQUEUE_TIMEOUT
     );
 }
 
