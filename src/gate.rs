@@ -170,7 +170,7 @@ pub struct PolicyGate<
     M: PolicyGateMetrics = NoopPolicyGateMetrics,
     D = TokioTimeDriver,
 > {
-    state: Arc<GateState<T, C, M, D>>,
+    pub(crate) state: Arc<GateState<T, C, M, D>>,
     metrics: M,
 }
 
@@ -294,16 +294,6 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
     #[must_use]
     pub const fn metrics(&self) -> M {
         self.metrics
-    }
-
-    #[cfg(feature = "tower-layer")]
-    pub(crate) fn refresh_disabled(&self) -> bool {
-        self.state.config.refresh_before_expiry().is_zero()
-    }
-
-    #[cfg(feature = "tower-layer")]
-    pub(crate) fn try_cached_now(&self, subject: &T) -> Option<Admission<D>> {
-        self.state.check_without_refresh(subject)
     }
 
     #[cfg(feature = "tower-layer")]
@@ -775,7 +765,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
     refresh_tx: MpscSender<PendingFuture>,
-    config: PolicyGateConfig,
+    pub(crate) config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
 }
@@ -864,7 +854,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 
     #[cfg(feature = "tower-layer")]
-    fn check_without_refresh(self: &Arc<Self>, subject: &T) -> Option<Admission<D>> {
+    pub(crate) fn check_without_refresh(self: &Arc<Self>, subject: &T) -> Option<Admission<D>> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
         entry.verdict_at(D::now())?;

@@ -103,9 +103,18 @@ where
                 }
                 Observed::Denied | Observed::Expired => break,
                 Observed::Stale => {
-                    if let Some(admission) = this.context.gate.try_cached_now(this.subject) {
+                    if let Some(admission) =
+                        this.context.gate.state.check_without_refresh(this.subject)
+                    {
                         if admission.is_allowed() {
-                            if this.context.gate.refresh_disabled() {
+                            if this
+                                .context
+                                .gate
+                                .state
+                                .config
+                                .refresh_before_expiry()
+                                .is_zero()
+                            {
                                 *this.readmission = None;
                                 *this.admission = admission;
                                 continue;

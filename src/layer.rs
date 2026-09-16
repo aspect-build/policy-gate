@@ -588,9 +588,15 @@ where
                 .missing_subject(self.body, &self.context.missing_subject_message)))));
         };
 
-        let refresh_disabled = self.context.gate.refresh_disabled();
+        let refresh_disabled = self
+            .context
+            .gate
+            .state
+            .config
+            .refresh_before_expiry()
+            .is_zero();
         if refresh_disabled {
-            if let Some(admission) = self.context.gate.try_cached_now(&subject) {
+            if let Some(admission) = self.context.gate.state.check_without_refresh(&subject) {
                 if admission.is_allowed() {
                     return Either::Left(pass_through(
                         &mut self.inner,
