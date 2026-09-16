@@ -248,10 +248,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
         time: D,
     ) -> crate::PolicyGateParts<T, C, M, D> {
         let (connected, connectivity) = async_watch::channel(false);
-        let (state, refreshes) =
+        let (state, refresh_rx) =
             GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
         let (watcher, health) =
-            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected, refreshes);
+            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected, refresh_rx);
         (Self { state, metrics }, watcher, health)
     }
 
@@ -711,7 +711,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
-    refreshes: UnboundedSender<PendingFuture>,
+    refresh_tx: UnboundedSender<PendingFuture>,
     config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
@@ -738,7 +738,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     ) -> (Arc<Self>, UnboundedReceiver<PendingFuture>) {
         let now = D::now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
-        let (refreshes, refresh_requests) = futures_channel::mpsc::unbounded();
+        let (refresh_tx, refresh_rx) = futures_channel::mpsc::unbounded();
         let state = Arc::new(Self {
             client,
             connected,
@@ -755,12 +755,12 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 next_allowed: now,
             }),
             shape_dirty,
-            refreshes,
+            refresh_tx,
             config: *config,
             metrics,
             _time: PhantomData,
         });
-        (state, refresh_requests)
+        (state, refresh_rx)
     }
 
     /// Returns the total admission time budget.
@@ -1121,7 +1121,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         .compare_and_swap(&None::<Arc<PendingFetch>>, Some(Arc::clone(&refresh)))
                         .is_none()
                     {
-                        if self.refreshes.unbounded_send(refresh.future()).is_err() {
+                        if self.refresh_tx.unbounded_send(refresh.future()).is_err() {
                             entry.abort_pending();
                         }
                     } else {

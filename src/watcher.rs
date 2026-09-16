@@ -104,7 +104,7 @@ impl DecisionWatcher {
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
-        refresh_requests: UnboundedReceiver<PendingFuture>,
+        refresh_rx: UnboundedReceiver<PendingFuture>,
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
@@ -118,7 +118,7 @@ impl DecisionWatcher {
             _time: PhantomData,
         });
         let lease = WatchLease { state, connected };
-        let future = watch_source(lease, client, metrics, refresh_requests).boxed();
+        let future = watch_source(lease, client, metrics, refresh_rx).boxed();
         (Self { future }, health)
     }
 }
@@ -148,7 +148,7 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
     lease: WatchLease<T, C, M, D>,
     client: Arc<C>,
     metrics: M,
-    mut refresh_requests: UnboundedReceiver<PendingFuture>,
+    mut refresh_rx: UnboundedReceiver<PendingFuture>,
 ) {
     let initial_reconnect_delay = lease.state.initial_reconnect_delay();
     let max_reconnect_delay = lease.state.max_reconnect_delay();
@@ -169,7 +169,7 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
                 futures_util::pin_mut!(stream, stable_timer);
                 let mut events_since_yield = 0;
                 loop {
-                    let refresh_request = refresh_requests.next().fuse();
+                    let refresh_request = refresh_rx.next().fuse();
                     let refresh = refreshes.select_next_some();
                     futures_util::pin_mut!(refresh_request, refresh);
                     let item = futures_util::select! {
