@@ -540,11 +540,10 @@ impl Entry {
         Some(Generation::clone(&refresh.generation))
     }
 
-    fn apply_refresh_result(
+    fn apply_refresh_result<D: TimeDriver>(
         &self,
         generation: &Generation,
         result: &FetchResult,
-        now: Instant,
         ttl: Duration,
     ) {
         let mut refresh = self
@@ -556,6 +555,7 @@ impl Entry {
             return;
         }
         refresh.refresh_in_flight = false;
+        let now = D::now();
         let current = self.current.load(Ordering::Acquire);
         if !matches!(
             decode_entry_state(current),
@@ -571,6 +571,22 @@ impl Entry {
             );
             refresh.generation = Generation::new(());
         }
+    }
+
+    fn refresh_is_current<D: TimeDriver>(&self, generation: &Generation) -> bool {
+        let refresh = self
+            .refresh
+            .as_ref()
+            .expect("refresh work exists only when configured")
+            .lock();
+        if !Generation::ptr_eq(&refresh.generation, generation) || !refresh.refresh_in_flight {
+            return false;
+        }
+        let current = self.current.load(Ordering::Acquire);
+        matches!(
+            decode_entry_state(current),
+            EntryState::Allowed | EntryState::Denied
+        ) && !self.is_expired_at(current, D::now())
     }
 
     fn pending_operation(&self) -> Option<Arc<PendingFetch>> {
@@ -823,14 +839,7 @@ struct PublishState {
     next_allowed: Instant,
 }
 
-pub(crate) struct DecisionRefresh<T: Subject> {
-    subject: T,
-    entry: Arc<Entry>,
-    generation: Generation,
-    result: FetchResult,
-}
-
-pub(crate) type DecisionRefreshFuture<T> = BoxFuture<'static, DecisionRefresh<T>>;
+pub(crate) type DecisionRefreshFuture = BoxFuture<'static, ()>;
 
 /// Owns authoritative subject state and its cached read snapshot.
 pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> {
@@ -843,7 +852,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
-    refreshes: Option<UnboundedSender<DecisionRefreshFuture<T>>>,
+    refreshes: Option<UnboundedSender<DecisionRefreshFuture>>,
     config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
@@ -867,10 +876,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         metrics: M,
         _time: D,
         connected: Receiver<bool>,
-    ) -> (
-        Arc<Self>,
-        Option<UnboundedReceiver<DecisionRefreshFuture<T>>>,
-    ) {
+    ) -> (Arc<Self>, Option<UnboundedReceiver<DecisionRefreshFuture>>) {
         let now = D::now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
         let (refreshes, refresh_requests) =
@@ -1219,7 +1225,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         Some(admission)
     }
 
-    fn refresh_on_access(&self, subject: &T, entry: Arc<Entry>) {
+    fn refresh_on_access(self: &Arc<Self>, subject: &T, entry: Arc<Entry>) {
         let Some(refresh_ahead) = self.config.decision_refresh_ahead() else {
             return;
         };
@@ -1234,34 +1240,32 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             .unbounded_send(refresh);
     }
 
-    pub(crate) fn apply_decision_refresh(&self, refresh: DecisionRefresh<T>) {
-        let now = D::now();
-        let DecisionRefresh {
-            subject,
-            entry,
-            generation,
-            result,
-        } = refresh;
-        self.subjects.apply_if_current(&subject, &entry, now, || {
-            entry.apply_refresh_result(
-                &generation,
-                &result,
-                now,
-                self.config.decision_freshness_ttl(),
-            );
-        });
+    fn refresh_is_current(&self, subject: &T, entry: &Arc<Entry>, generation: &Generation) -> bool {
+        self.subjects
+            .apply_if_current(subject, entry, D::now(), || {
+                entry.refresh_is_current::<D>(generation)
+            })
+            .unwrap_or(false)
     }
 
     fn new_decision_refresh(
-        &self,
+        self: &Arc<Self>,
         subject: T,
         entry: Arc<Entry>,
         generation: Generation,
-    ) -> DecisionRefreshFuture<T> {
+    ) -> DecisionRefreshFuture {
         let client = Arc::clone(&self.client);
         let metrics = self.metrics;
         let unary_timeout = self.config.unary_timeout();
+        let gate = Arc::downgrade(self);
         async move {
+            let Some(current_gate) = gate.upgrade() else {
+                return;
+            };
+            if !current_gate.refresh_is_current(&subject, &entry, &generation) {
+                return;
+            }
+            drop(current_gate);
             metrics.unary_call();
             let result = async {
                 let decision = D::timeout(unary_timeout, client.get_subject_decision(&subject))
@@ -1289,11 +1293,15 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             if result.is_err() {
                 metrics.unary_failure();
             }
-            DecisionRefresh {
-                subject,
-                entry,
-                generation,
-                result,
+            if let Some(gate) = gate.upgrade() {
+                gate.subjects
+                    .apply_if_current(&subject, &entry, D::now(), || {
+                        entry.apply_refresh_result::<D>(
+                            &generation,
+                            &result,
+                            gate.config.decision_freshness_ttl(),
+                        );
+                    });
             }
         }
         .boxed()

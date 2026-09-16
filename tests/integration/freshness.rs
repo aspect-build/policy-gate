@@ -11,6 +11,7 @@ use http_body::{Body as _, Frame};
 use policy_gate::{Admission, AdmissionState, Decision};
 use tokio::sync::Semaphore;
 use tonic::{Code, Status};
+use uuid::Uuid;
 
 use crate::support::{
     ConfigOptions, GetAction, RecordingWaker, SUBJECT_A, SUBJECT_B, ScriptedDecisionSource, change,
@@ -378,6 +379,46 @@ async fn refresh_in_flight_at_expiry_cannot_revive_the_admission() {
 }
 
 #[tokio::test]
+async fn refresh_completion_rechecks_time_after_finding_the_current_entry() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    source
+        .push_get(SUBJECT_A, GetAction::Return(Ok(Decision::Allowed)))
+        .await;
+    let release = Arc::new(Semaphore::new(0));
+    source
+        .push_get(
+            SUBJECT_A,
+            GetAction::Gate {
+                release: Arc::clone(&release),
+                result: Ok(Decision::Allowed),
+            },
+        )
+        .await;
+    let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+    let admission = admit_allowed(&runtime, SUBJECT_A).await;
+    let subject = SUBJECT_A.parse().expect("test subject UUID");
+
+    runtime.time.advance(Duration::from_millis(80)).await;
+    drop(
+        runtime
+            .gate
+            .try_cached(&subject)
+            .expect("decision is fresh"),
+    );
+    source.wait_for_gets(2).await;
+    runtime
+        .time
+        .advance_after_next_now(Duration::from_millis(20));
+    release.add_permits(1);
+    source.wait_for_get_completions(2).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(admission.state(), AdmissionState::Stale);
+    runtime.stop().await;
+}
+
+#[tokio::test]
 async fn watch_change_supersedes_an_in_flight_refresh() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let watch = source.push_live_watch(Vec::new()).await;
@@ -457,6 +498,88 @@ async fn watch_change_resets_the_refresh_deadline() {
 
     assert_eq!(admission.state(), AdmissionState::Denied);
     runtime.stop().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn refresh_queue_yields_and_discards_work_from_the_previous_watch() {
+    const SUBJECTS: usize = 64;
+    const WORK_PER_YIELD: usize = 4;
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let first_watch = source.push_live_watch(Vec::new()).await;
+    let _second_watch = source.push_live_watch(Vec::new()).await;
+    let release = Arc::new(Semaphore::new(0));
+    let subjects: Vec<_> = (1..=SUBJECTS)
+        .map(|value| Uuid::from_u128(value as u128))
+        .collect();
+    for subject in &subjects {
+        let subject = subject.to_string();
+        source
+            .push_get(&subject, GetAction::Return(Ok(Decision::Allowed)))
+            .await;
+        source
+            .push_get(
+                &subject,
+                GetAction::Gate {
+                    release: Arc::clone(&release),
+                    result: Ok(Decision::Allowed),
+                },
+            )
+            .await;
+    }
+    let mut config = refresh_config();
+    config.watch_events_per_yield = WORK_PER_YIELD;
+    config.initial_reconnect_delay = Duration::from_millis(1);
+    config.max_reconnect_delay = Duration::from_millis(1);
+    let crate::support::TestRuntime {
+        gate,
+        watcher,
+        metrics,
+        time,
+        ..
+    } = runtime(Arc::clone(&source), &config);
+    let mut watcher = Box::pin(watcher);
+    let wake_counter = Arc::new(RecordingWaker::default());
+    let waker = wake_counter.waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(watcher.as_mut().poll(&mut context), Poll::Pending));
+
+    for subject in &subjects {
+        drop(gate.admit(subject).await.expect("admission succeeds"));
+    }
+    time.advance(Duration::from_millis(80)).await;
+    for subject in &subjects {
+        drop(gate.admit(subject).await.expect("decision is fresh"));
+    }
+    let initial_calls = source.get_calls();
+    assert!(matches!(watcher.as_mut().poll(&mut context), Poll::Pending));
+    assert!(
+        source.get_calls() - initial_calls <= WORK_PER_YIELD,
+        "one watcher poll must not drain the refresh queue"
+    );
+
+    first_watch
+        .send(Err(policy_gate::DecisionSourceError::new(
+            policy_gate::DecisionSourceErrorKind::Transient,
+            "test disconnect",
+        )))
+        .expect("first watch remains live");
+    for _ in 0..SUBJECTS {
+        assert!(matches!(watcher.as_mut().poll(&mut context), Poll::Pending));
+        if metrics.watch_disconnects.load(Ordering::Acquire) == 1 {
+            break;
+        }
+    }
+    assert_eq!(metrics.watch_disconnects.load(Ordering::Acquire), 1);
+    let calls_at_disconnect = source.get_calls();
+    assert!(calls_at_disconnect - initial_calls < SUBJECTS);
+
+    time.advance(Duration::from_millis(1)).await;
+    for _ in 0..=SUBJECTS * 2 {
+        assert!(matches!(watcher.as_mut().poll(&mut context), Poll::Pending));
+    }
+    assert_eq!(source.watch_calls(), 2);
+    assert_eq!(source.get_calls(), calls_at_disconnect);
 }
 
 #[tokio::test]

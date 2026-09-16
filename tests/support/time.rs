@@ -14,6 +14,7 @@ struct ClockState {
     now: Instant,
     next_sleep_id: u64,
     sleepers: Vec<Sleeper>,
+    advance_after_next_now: Option<Duration>,
 }
 
 struct Sleeper {
@@ -46,6 +47,7 @@ impl TestTimeDriver {
                 now: Instant::now(),
                 next_sleep_id: 0,
                 sleepers: Vec::new(),
+                advance_after_next_now: None,
             });
         });
         Self
@@ -77,6 +79,11 @@ impl TestTimeDriver {
             waker.wake();
         }
         tokio::task::yield_now().await;
+    }
+
+    #[allow(dead_code, clippy::unused_self)]
+    pub(crate) fn advance_after_next_now(self, duration: Duration) {
+        with_clock(|clock| clock.advance_after_next_now = Some(duration));
     }
 }
 
@@ -122,7 +129,13 @@ impl Drop for TestSleep {
 
 impl TimeDriver for TestTimeDriver {
     fn now() -> Instant {
-        with_clock(|clock| clock.now)
+        with_clock(|clock| {
+            let now = clock.now;
+            if let Some(duration) = clock.advance_after_next_now.take() {
+                clock.now += duration;
+            }
+            now
+        })
     }
 
     fn sleep_until(deadline: Instant) -> impl Future<Output = ()> + Send {

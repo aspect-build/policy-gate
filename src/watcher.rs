@@ -104,7 +104,7 @@ impl DecisionWatcher {
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
-        refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture<T>>>,
+        refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture>>,
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
@@ -148,7 +148,7 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
     lease: WatchLease<T, C, M, D>,
     client: Arc<C>,
     metrics: M,
-    mut refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture<T>>>,
+    mut refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture>>,
 ) {
     let initial_reconnect_delay = lease.state.initial_reconnect_delay();
     let max_reconnect_delay = lease.state.max_reconnect_delay();
@@ -252,7 +252,7 @@ async fn watch_connected_with_refresh<
     metrics: M,
     stability_delay: Duration,
     work_per_yield: usize,
-    refresh_requests: &mut UnboundedReceiver<DecisionRefreshFuture<T>>,
+    refresh_requests: &mut UnboundedReceiver<DecisionRefreshFuture>,
 ) -> bool {
     let stream = stream.fuse();
     let stable_timer = D::sleep(stability_delay).fuse();
@@ -274,10 +274,14 @@ async fn watch_connected_with_refresh<
                 if let Some(request) = request {
                     refreshes.push(request);
                 }
+                work_since_yield += 1;
+                if work_since_yield == work_per_yield {
+                    work_since_yield = 0;
+                    D::yield_now().await;
+                }
                 continue;
             },
-            refresh = refresh => {
-                state.apply_decision_refresh(refresh);
+            () = refresh => {
                 work_since_yield += 1;
                 if work_since_yield == work_per_yield {
                     work_since_yield = 0;
