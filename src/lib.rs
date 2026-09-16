@@ -23,6 +23,12 @@
 //! [`AdmissionUnavailable`] once [`PolicyGateConfig::admission_timeout`] elapses. Dropping the
 //! watcher stops new admissions permanently and leaves every admission stale.
 //!
+//! Absolute decision freshness is opt-in. A finite freshness TTL enables it; the default
+//! [`DEFAULT_DECISION_FRESHNESS_TTL`] sentinel never expires. When enabled, ordinary cache access
+//! never extends a decision's deadline. Handles and admissions check expiry on access; stream bodies
+//! cut off expired decisions on their next poll. Time alone never wakes an idle stream.
+//! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
+//!
 //! # Example
 //!
 //! ```
@@ -216,6 +222,10 @@ pub const DEFAULT_WATCH_EVENTS_PER_YIELD: usize = 64;
 pub const DEFAULT_MAX_SUBJECTS: usize = 65_536;
 /// Default [`PolicyGateConfigBuilder::subject_ttl`].
 pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(3_600);
+/// Default [`PolicyGateConfigBuilder::decision_freshness_ttl`].
+///
+/// This exact value is the never-expire sentinel; the runtime does not turn it into a deadline.
+pub const DEFAULT_DECISION_FRESHNESS_TTL: Duration = Duration::MAX;
 
 /// Authoritative decision returned for one subject.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,6 +320,7 @@ pub struct PolicyGateConfig {
     watch_events_per_yield: usize,
     max_subjects: usize,
     subject_ttl: Duration,
+    decision_freshness_ttl: Duration,
 }
 
 impl PolicyGateConfig {
@@ -329,6 +340,7 @@ impl PolicyGateConfig {
                 watch_events_per_yield: DEFAULT_WATCH_EVENTS_PER_YIELD,
                 max_subjects: DEFAULT_MAX_SUBJECTS,
                 subject_ttl: DEFAULT_SUBJECT_TTL,
+                decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
             },
         }
     }
@@ -412,6 +424,16 @@ impl PolicyGateConfig {
     #[must_use]
     pub const fn subject_ttl(&self) -> Duration {
         self.subject_ttl
+    }
+
+    /// Absolute age after which an authoritative decision is no longer usable.
+    ///
+    /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
+    /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
+    /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
+    #[must_use]
+    pub const fn decision_freshness_ttl(&self) -> Duration {
+        self.decision_freshness_ttl
     }
 }
 
@@ -509,6 +531,14 @@ impl PolicyGateConfigBuilder {
         self
     }
 
+    /// Sets [`PolicyGateConfig::decision_freshness_ttl`]. Defaults to
+    /// [`DEFAULT_DECISION_FRESHNESS_TTL`].
+    #[must_use]
+    pub const fn decision_freshness_ttl(mut self, ttl: Duration) -> Self {
+        self.candidate.decision_freshness_ttl = ttl;
+        self
+    }
+
     /// Normalizes fields and checks cross-field rules.
     ///
     /// # Errors
@@ -566,6 +596,14 @@ impl PolicyGateConfigBuilder {
         if candidate.max_subjects == 0 {
             return Err(ConfigError::MaxSubjectsZero);
         }
+        if candidate.decision_freshness_ttl.is_zero() {
+            return Err(ConfigError::DecisionFreshnessTtlZero);
+        }
+        if candidate.decision_freshness_ttl != DEFAULT_DECISION_FRESHNESS_TTL
+            && now.checked_add(candidate.decision_freshness_ttl).is_none()
+        {
+            return Err(ConfigError::DurationOverflow("decision freshness TTL"));
+        }
         Ok(candidate)
     }
 }
@@ -591,6 +629,8 @@ pub enum ConfigError {
     DurationOverflow(&'static str),
     /// The subject-map capacity is zero, so no subject could ever be cached.
     MaxSubjectsZero,
+    /// A zero freshness TTL would make every authoritative decision immediately unusable.
+    DecisionFreshnessTtlZero,
 }
 
 impl fmt::Display for ConfigError {
@@ -621,6 +661,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "{name} is too large to represent as an Instant deadline")
             }
             Self::MaxSubjectsZero => f.write_str("maximum subject count must be greater than zero"),
+            Self::DecisionFreshnessTtlZero => {
+                f.write_str("decision freshness TTL must be greater than zero")
+            }
         }
     }
 }

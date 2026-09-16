@@ -3,7 +3,7 @@
 use core::hash::Hash;
 use core::marker::PhantomData;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -85,10 +85,10 @@ pub enum AdmissionState {
     /// The authority has denied the subject; admitted work must stop.
     Denied,
     /// No authoritative state is known any more, because the watch went down or the subject was
-    /// evicted from the cache.
+    /// evicted from the cache, or the decision expired.
     ///
-    /// This state is terminal for the admission: a new verdict arrives only through
-    /// [`PolicyGate::try_cached`] or [`PolicyGate::admit`].
+    /// Expired entries can receive a new authoritative watch decision. Eviction and watch
+    /// disconnection are terminal for the admission; readmit the subject to obtain a new one.
     Stale,
 }
 
@@ -101,12 +101,15 @@ pub enum AdmissionState {
 /// Read [`Admission::state`] or [`Admission::is_allowed`] before each activity. Authority changes
 /// update the shared entry but never wake a handle; admission lookups coordinate through
 /// [`PolicyGate::admit`].
+/// Its default type parameter is [`TokioTimeDriver`]; the parameter selects a clock domain and
+/// carries no per-instance state.
 #[derive(Clone)]
-pub struct Admission {
+pub struct Admission<D = TokioTimeDriver> {
     entry: Arc<Entry>,
+    _time: PhantomData<D>,
 }
 
-impl core::fmt::Debug for Admission {
+impl<D: TimeDriver> core::fmt::Debug for Admission<D> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Admission")
             .field("state", &self.state())
@@ -114,24 +117,27 @@ impl core::fmt::Debug for Admission {
     }
 }
 
-impl Admission {
-    /// Returns the current admission state using one atomic load.
+impl<D: TimeDriver> Admission<D> {
+    /// Returns the current state, treating an expired decision as [`AdmissionState::Stale`].
+    ///
+    /// Expiration is checked lazily: this read does not mutate the entry or start asynchronous work.
     #[must_use]
     pub fn state(&self) -> AdmissionState {
-        match self.entry.state() {
-            EntryState::Allowed => AdmissionState::Allowed,
-            EntryState::Denied => AdmissionState::Denied,
-            EntryState::Stale => AdmissionState::Stale,
-            EntryState::Pending => {
-                unreachable!("an admission is created only from an authoritative state")
-            }
+        match self.observe() {
+            Observed::Allowed => AdmissionState::Allowed,
+            Observed::Denied => AdmissionState::Denied,
+            Observed::Expired | Observed::Stale => AdmissionState::Stale,
         }
     }
 
-    /// Returns whether the current authoritative decision allows this subject.
+    /// Returns whether the current decision is allowed, authoritative, and unexpired.
     #[must_use]
     pub fn is_allowed(&self) -> bool {
         self.state() == AdmissionState::Allowed
+    }
+
+    pub(crate) fn observe(&self) -> Observed {
+        self.entry.observed_at(D::now())
     }
 }
 
@@ -250,10 +256,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
     /// Returns a cached authoritative admission without waiting or issuing I/O.
     ///
     /// This is the cached path and performs no I/O. `None` means the snapshot cannot answer — the
-    /// subject is unknown, its verdict is still being fetched, its cached state went stale, or the
-    /// watch is down — and the caller should fall back to [`PolicyGate::admit`].
+    /// subject is unknown, its verdict is still being fetched, its cached state went stale or
+    /// expired, or the watch is down — and the caller should fall back to [`PolicyGate::admit`].
     #[must_use]
-    pub fn try_cached(&self, subject: &T) -> Option<Admission> {
+    pub fn try_cached(&self, subject: &T) -> Option<Admission<D>> {
         self.state.check(subject)
     }
 
@@ -270,7 +276,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
     /// configured admission deadline, when the lookup fails with
     /// [`DecisionSourceErrorKind::Permanent`](crate::DecisionSourceErrorKind::Permanent) or
     /// [`Wire`](crate::DecisionSourceErrorKind::Wire), or after the watcher future has been dropped.
-    pub async fn admit(&self, subject: &T) -> Result<Admission, AdmissionUnavailable> {
+    pub async fn admit(&self, subject: &T) -> Result<Admission<D>, AdmissionUnavailable> {
         self.state.admit(subject).await.ok_or(AdmissionUnavailable)
     }
 
@@ -290,7 +296,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
         &self,
         subject: &T,
         delay: Duration,
-    ) -> Result<Admission, AdmissionUnavailable> {
+    ) -> Result<Admission<D>, AdmissionUnavailable> {
         D::sleep(delay).await;
         self.admit(subject).await
     }
@@ -313,6 +319,13 @@ impl From<Decision> for EntryState {
             Decision::Denied => Self::Denied,
         }
     }
+}
+
+pub(crate) enum Observed {
+    Allowed,
+    Denied,
+    Expired,
+    Stale,
 }
 
 type FetchResult = Result<Decision, DecisionSourceError>;
@@ -340,50 +353,123 @@ impl PendingFetch {
 // causing false sharing on 64- or 128-byte cache lines.
 #[repr(align(128))]
 pub(crate) struct Entry {
-    // Atomic representation of EntryState.
-    current: AtomicU8,
+    // Low two bits encode state; the upper bits encode nanoseconds since `epoch`.
+    current: AtomicU64,
+    epoch: Instant,
     pending: ArcSwapOption<PendingFetch>,
 }
 
 impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Entry")
-            .field("state", &self.state())
+            .field(
+                "state",
+                &decode_entry_state(self.current.load(Ordering::Acquire)),
+            )
             .finish_non_exhaustive()
     }
 }
 
+const STATE_MASK: u64 = 0b11;
+const NO_EXPIRY: u64 = (1_u64 << 62) - 1;
+const MAX_FINITE_DEADLINE: u64 = NO_EXPIRY - 1;
+
 impl Entry {
-    fn pending(fetch: Arc<PendingFetch>) -> Self {
+    fn pending(epoch: Instant, fetch: Arc<PendingFetch>) -> Self {
         Self {
-            current: AtomicU8::new(EntryState::Pending as u8),
+            current: AtomicU64::new(Self::word(EntryState::Pending, NO_EXPIRY)),
+            epoch,
             pending: ArcSwapOption::from(Some(fetch)),
         }
     }
 
-    /// Loads the current entry state.
-    pub(crate) fn state(&self) -> EntryState {
-        decode_entry_state(self.current.load(Ordering::Acquire))
+    fn state_at(&self, now: Instant) -> EntryState {
+        let decision = self.current.load(Ordering::Acquire);
+        if self.is_expired_at(decision, now) {
+            EntryState::Stale
+        } else {
+            decode_entry_state(decision)
+        }
     }
 
-    fn verdict(&self) -> Option<Decision> {
-        match self.state() {
+    fn observed_at(&self, now: Instant) -> Observed {
+        let decision = self.current.load(Ordering::Acquire);
+        if self.is_expired_at(decision, now) {
+            return Observed::Expired;
+        }
+        match decode_entry_state(decision) {
+            EntryState::Pending => {
+                unreachable!("an admission is created only from an authoritative state")
+            }
+            EntryState::Stale => Observed::Stale,
+            EntryState::Allowed => Observed::Allowed,
+            EntryState::Denied => Observed::Denied,
+        }
+    }
+
+    fn verdict_at(&self, now: Instant) -> Option<Decision> {
+        let decision = self.current.load(Ordering::Acquire);
+        if self.is_expired_at(decision, now) {
+            return None;
+        }
+        match decode_entry_state(decision) {
             EntryState::Allowed => Some(Decision::Allowed),
             EntryState::Denied => Some(Decision::Denied),
             EntryState::Pending | EntryState::Stale => None,
         }
     }
 
-    fn compare_exchange(&self, current: EntryState, new: EntryState) -> Result<(), EntryState> {
-        self.current
-            .compare_exchange(
-                current as u8,
-                new as u8,
+    fn compare_exchange(
+        &self,
+        current: EntryState,
+        new: EntryState,
+        deadline: u64,
+    ) -> Result<(), EntryState> {
+        let mut previous = self.current.load(Ordering::Acquire);
+        loop {
+            let previous_state = decode_entry_state(previous);
+            if previous_state != current {
+                return Err(previous_state);
+            }
+            match self.current.compare_exchange_weak(
+                previous,
+                Self::word(new, deadline),
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            )
-            .map(|_| ())
-            .map_err(decode_entry_state)
+            ) {
+                Ok(_) => return Ok(()),
+                Err(changed) => previous = changed,
+            }
+        }
+    }
+
+    fn deadline_after(&self, now: Instant, ttl: Duration) -> u64 {
+        if ttl == Duration::MAX {
+            return NO_EXPIRY;
+        }
+        let now = self.tick(now);
+        let Ok(ttl) = u64::try_from(ttl.as_nanos()) else {
+            return now;
+        };
+        // An unrepresentable finite deadline is immediately expired.
+        now.checked_add(ttl)
+            .filter(|deadline| *deadline < NO_EXPIRY)
+            .unwrap_or(now)
+    }
+
+    const fn word(state: EntryState, deadline: u64) -> u64 {
+        (deadline << 2) | state as u64
+    }
+
+    fn tick(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.epoch).as_nanos())
+            .unwrap_or(MAX_FINITE_DEADLINE)
+            .min(MAX_FINITE_DEADLINE)
+    }
+
+    fn is_expired_at(&self, decision: u64, now: Instant) -> bool {
+        let deadline = decision >> 2;
+        deadline != NO_EXPIRY && self.tick(now) >= deadline
     }
 
     fn pending_operation(&self) -> Option<Arc<PendingFetch>> {
@@ -422,14 +508,28 @@ impl Entry {
         }
     }
 
-    fn admission(entry: Arc<Self>) -> Option<Admission> {
-        entry.verdict()?;
-        Some(Admission { entry })
+    fn admission<D: TimeDriver>(entry: Arc<Self>) -> Option<Admission<D>> {
+        entry.verdict_at(D::now())?;
+        Some(Admission {
+            entry,
+            _time: PhantomData,
+        })
     }
 
     fn invalidate(&self) {
-        self.current
-            .store(EntryState::Stale as u8, Ordering::Release);
+        let mut previous = self.current.load(Ordering::Acquire);
+        loop {
+            let stale = (previous & !STATE_MASK) | EntryState::Stale as u64;
+            match self.current.compare_exchange_weak(
+                previous,
+                stale,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(changed) => previous = changed,
+            }
+        }
         self.abort_pending();
     }
 }
@@ -678,19 +778,23 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         Arc::clone(&self.disconnected_since)
     }
 
+    fn decision_deadline(&self, entry: &Entry) -> u64 {
+        entry.deadline_after(D::now(), self.config.decision_freshness_ttl())
+    }
+
     /// Reads subject state through the snapshot and records its map recency.
-    pub(crate) fn check(&self, subject: &T) -> Option<Admission> {
+    pub(crate) fn check(&self, subject: &T) -> Option<Admission<D>> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
         // Pending and stale entries read as snapshot misses.
-        entry.verdict()?;
+        entry.verdict_at(D::now())?;
         self.subjects.touch(subject, entry, D::now());
         Entry::admission(Arc::clone(entry))
     }
 
     /// Resolves an authoritative subject verdict within the admission budget.
     #[allow(clippy::too_many_lines)]
-    pub(crate) async fn admit(self: &Arc<Self>, subject: &T) -> Option<Admission> {
+    pub(crate) async fn admit(self: &Arc<Self>, subject: &T) -> Option<Admission<D>> {
         let Some(deadline) = D::now().checked_add(self.config.admission_timeout()) else {
             return self.admission_timed_out();
         };
@@ -718,10 +822,14 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             }
 
             let mut inserted = false;
-            let entry = self.subjects.get_or_insert_with(subject, D::now(), || {
+            let now = D::now();
+            let entry = self.subjects.get_or_insert_with(subject, now, || {
                 inserted = true;
                 Arc::new_cyclic(|entry| {
-                    Entry::pending(self.new_fetch_after(entry.clone(), subject.clone(), None))
+                    Entry::pending(
+                        now,
+                        self.new_fetch_after(entry.clone(), subject.clone(), None),
+                    )
                 })
             });
             if inserted {
@@ -745,7 +853,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 continue;
             }
 
-            let pending = match entry.state() {
+            let pending = match entry.state_at(D::now()) {
                 EntryState::Allowed | EntryState::Denied => {
                     self.metrics.map_hit();
                     if let Some(admission) = Entry::admission(entry) {
@@ -757,7 +865,9 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                     let Some(fetch) = entry.pending_operation() else {
                         continue;
                     };
-                    if !matches!(entry.state(), EntryState::Pending) || !entry.pending_is(&fetch) {
+                    if !matches!(entry.state_at(D::now()), EntryState::Pending)
+                        || !entry.pending_is(&fetch)
+                    {
                         continue;
                     }
                     (entry, fetch)
@@ -767,7 +877,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         if !Arc::ptr_eq(current, &entry) {
                             return false;
                         }
-                        matches!(current.state(), EntryState::Stale)
+                        matches!(current.state_at(D::now()), EntryState::Stale)
                     });
                     if removed {
                         self.shape_dirty.store(true, Ordering::Release);
@@ -803,7 +913,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             if !*connected.borrow() {
                 continue;
             }
-            match entry.state() {
+            match entry.state_at(D::now()) {
                 EntryState::Allowed | EntryState::Denied => {
                     if let Some(admission) = Entry::admission(entry) {
                         return Some(admission);
@@ -908,7 +1018,11 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         if let Ok(decision) = result {
             // A watch event that wins this CAS supplies the verdict that stands.
             if entry
-                .compare_exchange(EntryState::Pending, (*decision).into())
+                .compare_exchange(
+                    EntryState::Pending,
+                    (*decision).into(),
+                    self.decision_deadline(entry),
+                )
                 .is_ok()
             {
                 entry.replace_pending(generation, None);
@@ -917,7 +1031,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         }
 
         if result.as_ref().is_err_and(is_permanent_status) {
-            if matches!(entry.state(), EntryState::Pending) {
+            if matches!(entry.state_at(D::now()), EntryState::Pending) {
                 let retry = self.new_fetch_after(
                     Arc::downgrade(entry),
                     subject.clone(),
@@ -935,7 +1049,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 return false;
             }
             entry
-                .compare_exchange(EntryState::Pending, EntryState::Stale)
+                .compare_exchange(EntryState::Pending, EntryState::Stale, NO_EXPIRY)
                 .is_ok()
         });
         if removed {
@@ -944,7 +1058,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         self.republish_if_due();
     }
 
-    fn admission_timed_out(&self) -> Option<Admission> {
+    fn admission_timed_out(&self) -> Option<Admission<D>> {
         self.metrics.admission_timeout();
         None
     }
@@ -987,11 +1101,15 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             if let Some(entry) = entry {
                 let next = decision.into();
                 loop {
-                    match entry.state() {
+                    match decode_entry_state(entry.current.load(Ordering::Acquire)) {
                         EntryState::Stale => break,
                         current @ (EntryState::Pending
                         | EntryState::Allowed
-                        | EntryState::Denied) => match entry.compare_exchange(current, next) {
+                        | EntryState::Denied) => match entry.compare_exchange(
+                            current,
+                            next,
+                            self.decision_deadline(&entry),
+                        ) {
                             Ok(()) => {
                                 entry.abort_pending();
                                 break;
@@ -1064,13 +1182,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 }
 
-fn decode_entry_state(raw: u8) -> EntryState {
-    match raw {
+const fn decode_entry_state(decision: u64) -> EntryState {
+    match decision & STATE_MASK {
         0 => EntryState::Pending,
         1 => EntryState::Allowed,
         2 => EntryState::Denied,
         3 => EntryState::Stale,
-        _ => unreachable!("entry state is always written from EntryState"),
+        _ => unreachable!(),
     }
 }
 

@@ -668,7 +668,7 @@ pub struct EnforcedResponseFuture<
     #[pin]
     inner: F,
     subject: T,
-    admission: Option<Admission>,
+    admission: Option<Admission<D>>,
     context: Arc<GateContext<T, C, M, D>>,
     body: A,
     response: R,
@@ -738,7 +738,7 @@ fn pass_through<S, ResBody, P, T, C, A, M, R, D>(
     inner: &mut S,
     request: Request<A::Body>,
     subject: T,
-    admission: Admission,
+    admission: Admission<D>,
     context: Arc<GateContext<T, C, M, D>>,
     policy: &P,
     response_context: ResponseContext<A, R>,

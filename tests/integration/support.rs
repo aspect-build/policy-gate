@@ -361,6 +361,7 @@ pub(crate) struct ConfigOptions {
     pub(crate) watch_events_per_yield: usize,
     pub(crate) max_subjects: usize,
     pub(crate) subject_ttl: Duration,
+    pub(crate) decision_freshness_ttl: Duration,
 }
 
 impl Default for ConfigOptions {
@@ -377,6 +378,7 @@ impl Default for ConfigOptions {
             watch_events_per_yield: 64,
             max_subjects: 65_536,
             subject_ttl: Duration::from_secs(3_600),
+            decision_freshness_ttl: Duration::MAX,
         }
     }
 }
@@ -394,6 +396,7 @@ pub(crate) fn validated(options: &ConfigOptions) -> PolicyGateConfig {
         .watch_events_per_yield(options.watch_events_per_yield)
         .max_subjects(options.max_subjects)
         .subject_ttl(options.subject_ttl)
+        .decision_freshness_ttl(options.decision_freshness_ttl)
         .build()
         .expect("test config must validate")
 }
