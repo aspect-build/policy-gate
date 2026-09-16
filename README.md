@@ -89,8 +89,9 @@ before delivering more traffic. With the default zero refresh window, an entirel
 idle: there is no expiration timer, background scan, or authority-change observer. With a nonzero
 refresh window, the first cache read within that window starts one background lookup. Concurrent
 reads do not start another lookup while it is pending. A failed refresh does not extend the
-deadline and may be retried by a later read. A new watch decision installs a new absolute deadline;
-watch disconnects and eviction retain their existing stale/readmission recovery behavior. The default
-`DEFAULT_DECISION_FRESHNESS_TTL` is exactly `Duration::MAX`, a never-expire sentinel that is not
-converted into an `Instant`. Freshness and background refresh are disabled by default, so existing
-users retain the original request and unary-call behavior.
+deadline and may be retried by a later read. A cached access waits at most
+`refresh_enqueue_timeout` (100 ms by default) for queue capacity. A new watch decision installs a new
+absolute deadline; watch disconnects and eviction retain their existing stale/readmission recovery
+behavior. The default `DEFAULT_DECISION_FRESHNESS_TTL` is exactly `Duration::MAX`, a never-expire
+sentinel that is not converted into an `Instant`. Freshness and background refresh are disabled by
+default, so existing users retain the original request and unary-call behavior.

@@ -230,6 +230,8 @@ pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(3_600);
 pub const DEFAULT_DECISION_FRESHNESS_TTL: Duration = Duration::MAX;
 /// Default [`PolicyGateConfigBuilder::refresh_before_expiry`].
 pub const DEFAULT_REFRESH_BEFORE_EXPIRY: Duration = Duration::ZERO;
+/// Default [`PolicyGateConfigBuilder::refresh_enqueue_timeout`].
+pub const DEFAULT_REFRESH_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Number of background decision refreshes that may wait for the watcher.
 pub const DEFAULT_REFRESH_QUEUE_CAPACITY: usize = 1_024;
 
@@ -328,6 +330,7 @@ pub struct PolicyGateConfig {
     subject_ttl: Duration,
     decision_freshness_ttl: Duration,
     refresh_before_expiry: Duration,
+    refresh_enqueue_timeout: Duration,
     refresh_queue_capacity: usize,
 }
 
@@ -350,6 +353,7 @@ impl PolicyGateConfig {
                 subject_ttl: DEFAULT_SUBJECT_TTL,
                 decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
                 refresh_before_expiry: DEFAULT_REFRESH_BEFORE_EXPIRY,
+                refresh_enqueue_timeout: DEFAULT_REFRESH_ENQUEUE_TIMEOUT,
                 refresh_queue_capacity: DEFAULT_REFRESH_QUEUE_CAPACITY,
             },
         }
@@ -453,6 +457,13 @@ impl PolicyGateConfig {
     #[must_use]
     pub const fn refresh_before_expiry(&self) -> Duration {
         self.refresh_before_expiry
+    }
+
+    /// Maximum time a cached access waits to hand a refresh to the background watcher.
+    /// Admission also caps this wait at its remaining admission budget.
+    #[must_use]
+    pub const fn refresh_enqueue_timeout(&self) -> Duration {
+        self.refresh_enqueue_timeout
     }
 
     /// Maximum number of decision refreshes waiting for the background watcher.
@@ -572,6 +583,14 @@ impl PolicyGateConfigBuilder {
         self
     }
 
+    /// Sets the refresh queue handoff timeout. Defaults to
+    /// [`DEFAULT_REFRESH_ENQUEUE_TIMEOUT`].
+    #[must_use]
+    pub const fn refresh_enqueue_timeout(mut self, timeout: Duration) -> Self {
+        self.candidate.refresh_enqueue_timeout = timeout;
+        self
+    }
+
     /// Sets the decision refresh queue capacity. Defaults to
     /// [`DEFAULT_REFRESH_QUEUE_CAPACITY`].
     #[must_use]
@@ -629,6 +648,7 @@ impl PolicyGateConfigBuilder {
             ),
             ("initial reconnect delay", candidate.initial_reconnect_delay),
             ("maximum reconnect delay", candidate.max_reconnect_delay),
+            ("refresh enqueue timeout", candidate.refresh_enqueue_timeout),
         ] {
             if now.checked_add(duration).is_none() {
                 return Err(ConfigError::DurationOverflow(name));
@@ -639,6 +659,9 @@ impl PolicyGateConfigBuilder {
         }
         if candidate.refresh_queue_capacity == 0 {
             return Err(ConfigError::RefreshQueueCapacityZero);
+        }
+        if candidate.refresh_enqueue_timeout.is_zero() {
+            return Err(ConfigError::RefreshEnqueueTimeoutZero);
         }
         if candidate.decision_freshness_ttl.is_zero() {
             return Err(ConfigError::DecisionFreshnessTtlZero);
@@ -683,6 +706,8 @@ pub enum ConfigError {
     MaxSubjectsZero,
     /// The refresh queue capacity is zero, so no background lookup could be scheduled.
     RefreshQueueCapacityZero,
+    /// A zero queue handoff timeout would never attempt to enqueue a refresh.
+    RefreshEnqueueTimeoutZero,
     /// A zero freshness TTL would make every authoritative decision immediately unusable.
     DecisionFreshnessTtlZero,
     /// Refresh needs a finite freshness deadline to define its trigger window.
@@ -721,6 +746,9 @@ impl fmt::Display for ConfigError {
             Self::MaxSubjectsZero => f.write_str("maximum subject count must be greater than zero"),
             Self::RefreshQueueCapacityZero => {
                 f.write_str("refresh queue capacity must be greater than zero")
+            }
+            Self::RefreshEnqueueTimeoutZero => {
+                f.write_str("refresh enqueue timeout must be greater than zero")
             }
             Self::DecisionFreshnessTtlZero => {
                 f.write_str("decision freshness TTL must be greater than zero")

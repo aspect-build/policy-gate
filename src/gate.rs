@@ -264,10 +264,11 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
 
     /// Returns a cached authoritative admission without authority I/O.
     ///
-    /// This path performs no authority I/O, but may wait for refresh queue capacity. `None` means
-    /// the snapshot cannot answer — the subject is unknown, its verdict is still being fetched,
-    /// its cached state went stale or expired, or the watch is down — and the caller should fall
-    /// back to [`PolicyGate::admit`].
+    /// This path performs no authority I/O, but may wait up to
+    /// [`PolicyGateConfig::refresh_enqueue_timeout`](crate::PolicyGateConfig::refresh_enqueue_timeout)
+    /// for refresh queue capacity. `None` means the snapshot cannot answer — the subject is
+    /// unknown, its verdict is still being fetched, its cached state went stale or expired, or the
+    /// watch is down — and the caller should fall back to [`PolicyGate::admit`].
     #[must_use]
     pub async fn try_cached(&self, subject: &T) -> Option<Admission<D>> {
         self.state.check(subject).await
@@ -1169,7 +1170,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         self: &Arc<Self>,
         subject: &T,
         entry: &Arc<Entry>,
-        queue_deadline: Option<Instant>,
+        admission_deadline: Option<Instant>,
     ) -> Option<Admission<D>> {
         let admission = Entry::admission(Arc::clone(entry))?;
         let refresh_before = self.config.refresh_before_expiry();
@@ -1182,9 +1183,19 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             EntryState::Allowed | EntryState::Denied
         ) {
             let deadline = current >> 2;
-            let now = entry.tick(D::now());
+            let access_time = D::now();
+            let now = entry.tick(access_time);
             let refresh_before = u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX);
             if deadline != NO_EXPIRY && now < deadline && deadline - now <= refresh_before {
+                let queue_deadline =
+                    match access_time.checked_add(self.config.refresh_enqueue_timeout()) {
+                        Some(deadline) => admission_deadline
+                            .map_or(deadline, |outer_deadline| deadline.min(outer_deadline)),
+                        None => match admission_deadline {
+                            Some(deadline) => deadline,
+                            None => return Some(admission),
+                        },
+                    };
                 let refresh = self.new_fetch_after(
                     Arc::downgrade(entry),
                     subject.clone(),
@@ -1201,14 +1212,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         generation: &refresh.generation,
                         queued: false,
                     };
-                    let queued = if let Some(deadline) = queue_deadline {
-                        matches!(
-                            D::timeout_at(deadline, self.refresh_tx.send(refresh.future())).await,
-                            Ok(Ok(()))
-                        )
-                    } else {
-                        self.refresh_tx.send(refresh.future()).await.is_ok()
-                    };
+                    let queued = matches!(
+                        D::timeout_at(queue_deadline, self.refresh_tx.send(refresh.future())).await,
+                        Ok(Ok(()))
+                    );
                     if queued {
                         guard.mark_queued();
                     }
