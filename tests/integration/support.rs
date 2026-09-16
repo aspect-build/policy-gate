@@ -266,10 +266,6 @@ impl ScriptedDecisionSource {
         self.get_calls.load(Ordering::Acquire)
     }
 
-    pub(crate) fn get_completions(&self) -> usize {
-        self.get_completions.load(Ordering::Acquire)
-    }
-
     pub(crate) fn watch_calls(&self) -> usize {
         self.watch_calls.load(Ordering::Acquire)
     }

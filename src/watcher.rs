@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_watch::Sender;
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
@@ -16,7 +17,7 @@ use parking_lot::Mutex;
 use rand::RngCore;
 
 use crate::DecisionSourceErrorKind;
-use crate::gate::{DecisionSource, GateState, Subject};
+use crate::gate::{DecisionRefreshFuture, DecisionSource, GateState, Subject};
 use crate::metrics::PolicyGateMetrics;
 use crate::time::{TimeDriver, TokioTimeDriver};
 
@@ -72,8 +73,8 @@ impl<D: TimeDriver> DecisionSourceHealth<D> {
 ///
 /// The watcher is a future that never completes: it keeps the decision source's change stream
 /// open, applies each change to the gate's cache, and reopens the stream with jittered backoff
-/// after any failure. When refresh-ahead is configured, it also schedules and applies proactive
-/// decision refreshes. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
+/// after any failure. When refresh-ahead is configured, it also runs refreshes requested by cache
+/// reads. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
 ///
 /// Unary lookups and cache maintenance also mutate gate state, but only the watcher can supply or
 /// refresh an authoritative verdict, so its progress is a hard requirement rather than an
@@ -103,6 +104,7 @@ impl DecisionWatcher {
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
+        refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture<T>>>,
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
@@ -116,7 +118,7 @@ impl DecisionWatcher {
             _time: PhantomData,
         });
         let lease = WatchLease { state, connected };
-        let future = watch_source(lease, client, metrics).boxed();
+        let future = watch_source(lease, client, metrics, refresh_requests).boxed();
         (Self { future }, health)
     }
 }
@@ -146,6 +148,7 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
     lease: WatchLease<T, C, M, D>,
     client: Arc<C>,
     metrics: M,
+    mut refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture<T>>>,
 ) {
     let initial_reconnect_delay = lease.state.initial_reconnect_delay();
     let max_reconnect_delay = lease.state.max_reconnect_delay();
@@ -160,13 +163,14 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         match opened {
             Ok(Ok(stream)) => {
                 lease.state.watch_connected(&lease.connected);
-                let stable = if lease.state.refresh_enabled() {
+                let stable = if let Some(refresh_requests) = refresh_requests.as_mut() {
                     watch_connected_with_refresh::<T, C, M, D>(
                         Arc::clone(&lease.state),
                         stream,
                         metrics,
                         max_reconnect_delay,
                         watch_events_per_yield,
+                        refresh_requests,
                     )
                     .await
                 } else {
@@ -248,49 +252,32 @@ async fn watch_connected_with_refresh<
     metrics: M,
     stability_delay: Duration,
     work_per_yield: usize,
+    refresh_requests: &mut UnboundedReceiver<DecisionRefreshFuture<T>>,
 ) -> bool {
     let stream = stream.fuse();
     let stable_timer = D::sleep(stability_delay).fuse();
-    let mut freshness_changes = state.freshness_changes();
-    let mut freshness_deadline = state.take_scheduled_freshness_deadline();
     let mut refreshes = FuturesUnordered::new();
     futures_util::pin_mut!(stream, stable_timer);
     let mut stable = false;
     let mut work_since_yield = 0;
     loop {
-        let freshness_timer: BoxFuture<'_, ()> = if let Some(deadline) = freshness_deadline {
-            D::sleep_until(deadline).boxed()
-        } else {
-            core::future::pending().boxed()
-        };
-        let freshness_timer = freshness_timer.fuse();
-        let freshness_change = freshness_changes.changed().fuse();
+        let refresh_request = refresh_requests.next().fuse();
         let refresh = refreshes.select_next_some();
-        futures_util::pin_mut!(freshness_timer, freshness_change, refresh);
+        futures_util::pin_mut!(refresh_request, refresh);
         let item = futures_util::select! {
             () = stable_timer => {
                 stable = true;
                 state.watch_stable();
                 continue;
             },
-            () = freshness_timer => {
-                let (due, next) = state.freshness_work();
-                refreshes.extend(due);
-                freshness_deadline = next;
-                continue;
-            },
-            _ = freshness_change => {
-                freshness_deadline = earlier(
-                    freshness_deadline,
-                    state.take_scheduled_freshness_deadline(),
-                );
+            request = refresh_request => {
+                if let Some(request) = request {
+                    refreshes.push(request);
+                }
                 continue;
             },
             refresh = refresh => {
-                freshness_deadline = earlier(
-                    freshness_deadline,
-                    state.apply_decision_refresh(refresh),
-                );
+                state.apply_decision_refresh(refresh);
                 work_since_yield += 1;
                 if work_since_yield == work_per_yield {
                     work_since_yield = 0;
@@ -326,14 +313,6 @@ fn decode_watch_item<T: Subject, M: PolicyGateMetrics>(
             tracing::warn!(?error, "policy authority watch failed");
             None
         }
-    }
-}
-
-fn earlier(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(current.min(candidate)),
-        (Some(current), None) => Some(current),
-        (None, candidate) => candidate,
     }
 }
 

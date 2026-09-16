@@ -26,8 +26,9 @@
 //! Absolute decision freshness is opt-in. A finite freshness TTL enables it; the default
 //! [`DEFAULT_DECISION_FRESHNESS_TTL`] sentinel never expires. When enabled, ordinary cache access
 //! never extends a decision's deadline. Handles and admissions check expiry on access; stream bodies
-//! cut off expired decisions on their next poll. An optional refresh-ahead setting proactively
-//! refreshes subjects with live allowed admissions. Time alone never wakes an idle stream.
+//! cut off expired decisions on their next poll. An optional refresh-ahead setting starts one
+//! background refresh when a cached decision is read inside its refresh window. Time alone never
+//! wakes an idle stream.
 //! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
 //!
 //! # Example
@@ -434,14 +435,14 @@ impl PolicyGateConfig {
     /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
     /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
     /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
-    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_ahead`] to refresh live allowed
-    /// admissions before this deadline.
+    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_ahead`] to refresh cached
+    /// decisions on access before this deadline.
     #[must_use]
     pub const fn decision_freshness_ttl(&self) -> Duration {
         self.decision_freshness_ttl
     }
 
-    /// How long before freshness expiry a subject with a live allowed admission is refreshed.
+    /// How long before freshness expiry a cached subject read starts a background refresh.
     ///
     /// `None` disables proactive refresh while allowing absolute expiry to remain enabled. A value
     /// requires a finite [`PolicyGateConfig::decision_freshness_ttl`].
@@ -553,7 +554,7 @@ impl PolicyGateConfigBuilder {
         self
     }
 
-    /// Sets how long before decision freshness expiry a live allowed admission triggers a refresh.
+    /// Sets how long before decision freshness expiry a cached decision read triggers a refresh.
     ///
     /// This requires a finite [`PolicyGateConfigBuilder::decision_freshness_ttl`] and must be
     /// strictly less than that TTL.
