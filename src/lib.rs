@@ -228,8 +228,8 @@ pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(3_600);
 ///
 /// This exact value is the never-expire sentinel; the runtime does not turn it into a deadline.
 pub const DEFAULT_DECISION_FRESHNESS_TTL: Duration = Duration::MAX;
-/// Default [`PolicyGateConfigBuilder::decision_refresh_before_expiry`].
-pub const DEFAULT_DECISION_REFRESH_BEFORE_EXPIRY: Duration = Duration::ZERO;
+/// Default [`PolicyGateConfigBuilder::refresh_before_expiry`].
+pub const DEFAULT_REFRESH_BEFORE_EXPIRY: Duration = Duration::ZERO;
 
 /// Authoritative decision returned for one subject.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,7 +325,7 @@ pub struct PolicyGateConfig {
     max_subjects: usize,
     subject_ttl: Duration,
     decision_freshness_ttl: Duration,
-    decision_refresh_before_expiry: Duration,
+    refresh_before_expiry: Duration,
 }
 
 impl PolicyGateConfig {
@@ -346,7 +346,7 @@ impl PolicyGateConfig {
                 max_subjects: DEFAULT_MAX_SUBJECTS,
                 subject_ttl: DEFAULT_SUBJECT_TTL,
                 decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
-                decision_refresh_before_expiry: DEFAULT_DECISION_REFRESH_BEFORE_EXPIRY,
+                refresh_before_expiry: DEFAULT_REFRESH_BEFORE_EXPIRY,
             },
         }
     }
@@ -437,7 +437,7 @@ impl PolicyGateConfig {
     /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
     /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
     /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
-    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_before_expiry`] to refresh cached
+    /// Pair a finite TTL with [`PolicyGateConfig::refresh_before_expiry`] to refresh cached
     /// decisions on access before this deadline.
     #[must_use]
     pub const fn decision_freshness_ttl(&self) -> Duration {
@@ -447,8 +447,8 @@ impl PolicyGateConfig {
     /// Window before decision expiry in which a cached subject read starts a background refresh.
     /// Zero disables background refresh.
     #[must_use]
-    pub const fn decision_refresh_before_expiry(&self) -> Duration {
-        self.decision_refresh_before_expiry
+    pub const fn refresh_before_expiry(&self) -> Duration {
+        self.refresh_before_expiry
     }
 }
 
@@ -557,8 +557,8 @@ impl PolicyGateConfigBuilder {
     /// Sets the window before expiry in which a cached decision read triggers a refresh.
     /// Zero disables background refresh.
     #[must_use]
-    pub const fn decision_refresh_before_expiry(mut self, refresh_before: Duration) -> Self {
-        self.candidate.decision_refresh_before_expiry = refresh_before;
+    pub const fn refresh_before_expiry(mut self, refresh_before: Duration) -> Self {
+        self.candidate.refresh_before_expiry = refresh_before;
         self
     }
 

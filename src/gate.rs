@@ -474,26 +474,6 @@ impl Entry {
         deadline != NO_EXPIRY && self.tick(now) >= deadline
     }
 
-    fn refresh_if_due(&self, now: Instant, refresh_before: Duration) -> Option<u64> {
-        if refresh_before.is_zero() {
-            return None;
-        }
-        let decision = self.current.load(Ordering::Acquire);
-        if !matches!(
-            decode_entry_state(decision),
-            EntryState::Allowed | EntryState::Denied
-        ) {
-            return None;
-        }
-        let deadline = decision >> 2;
-        let now = self.tick(now);
-        let refresh_before = u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX);
-        if deadline == NO_EXPIRY || now >= deadline || deadline - now > refresh_before {
-            return None;
-        }
-        Some(decision)
-    }
-
     fn pending_operation(&self) -> Option<Arc<PendingFetch>> {
         self.pending.load_full()
     }
@@ -1124,18 +1104,34 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         entry: &Arc<Entry>,
     ) -> Option<Admission<D>> {
         let admission = Entry::admission(Arc::clone(entry))?;
-        if let Some(current) =
-            entry.refresh_if_due(D::now(), self.config.decision_refresh_before_expiry())
-        {
-            let refresh =
-                self.new_fetch_after(Arc::downgrade(entry), subject.clone(), None, Some(current));
-            if entry.install_pending(Arc::clone(&refresh)) {
-                if self.refreshes.unbounded_send(refresh.future()).is_err() {
-                    entry.abort_pending();
+        let refresh_before = self.config.refresh_before_expiry();
+        let current = entry.current.load(Ordering::Acquire);
+        match decode_entry_state(current) {
+            EntryState::Allowed | EntryState::Denied => {
+                let deadline = current >> 2;
+                let now = entry.tick(D::now());
+                let refresh_before = u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX);
+                if refresh_before != 0
+                    && deadline != NO_EXPIRY
+                    && now < deadline
+                    && deadline - now <= refresh_before
+                {
+                    let refresh = self.new_fetch_after(
+                        Arc::downgrade(entry),
+                        subject.clone(),
+                        None,
+                        Some(current),
+                    );
+                    if entry.install_pending(Arc::clone(&refresh)) {
+                        if self.refreshes.unbounded_send(refresh.future()).is_err() {
+                            entry.abort_pending();
+                        }
+                    } else {
+                        refresh.abort();
+                    }
                 }
-            } else {
-                refresh.abort();
             }
+            EntryState::Pending | EntryState::Stale => {}
         }
         Some(admission)
     }

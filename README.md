@@ -72,7 +72,7 @@ refresh cached decisions on access shortly before expiry.
 # use policy_gate::PolicyGateConfig;
 let config = PolicyGateConfig::builder()
     .decision_freshness_ttl(Duration::from_secs(60))
-    .decision_refresh_before_expiry(Duration::from_secs(10))
+    .refresh_before_expiry(Duration::from_secs(10))
     .build()?;
 # Ok::<(), policy_gate::ConfigError>(())
 ```
