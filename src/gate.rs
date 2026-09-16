@@ -104,18 +104,10 @@ pub enum AdmissionState {
 /// [`PolicyGate::admit`].
 /// Its default type parameter is [`TokioTimeDriver`]; the parameter selects a clock domain and
 /// carries no per-instance state.
+#[derive(Clone)]
 pub struct Admission<D = TokioTimeDriver> {
     entry: Arc<Entry>,
     _time: PhantomData<D>,
-}
-
-impl<D> Clone for Admission<D> {
-    fn clone(&self) -> Self {
-        Self {
-            entry: Arc::clone(&self.entry),
-            _time: PhantomData,
-        }
-    }
 }
 
 impl<D: TimeDriver> core::fmt::Debug for Admission<D> {
