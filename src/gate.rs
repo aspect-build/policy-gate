@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_watch::{Receiver, Sender};
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use futures_util::FutureExt;
 use futures_util::future::{AbortHandle, Abortable, Aborted, BoxFuture, Shared};
@@ -41,8 +40,8 @@ impl<T> Subject for T where T: Clone + Eq + Hash + Send + Sync + 'static {}
 ///
 /// Both methods are called from the gate's own tasks and must not block the async runtime. The
 /// gate applies [`PolicyGateConfig::unary_timeout`](crate::PolicyGateConfig::unary_timeout) to
-/// every admission or refresh lookup and reopens the watch with backoff, so an implementation
-/// needs no timeout or retry logic of its own. It does need to classify failures: the
+/// every lookup and reopens the watch with backoff, so an implementation needs no timeout or
+/// retry logic of its own. It does need to classify failures: the
 /// [`kind`](DecisionSourceError::kind) of a returned error decides whether the gate retries the
 /// call, fails admission, or counts a protocol violation.
 pub trait DecisionSource<T: Subject>: Send + Sync + 'static {
@@ -248,10 +247,9 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
         time: D,
     ) -> crate::PolicyGateParts<T, C, M, D> {
         let (connected, connectivity) = async_watch::channel(false);
-        let (state, refreshes) =
-            GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
+        let state = GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
         let (watcher, health) =
-            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected, refreshes);
+            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected);
         (Self { state, metrics }, watcher, health)
     }
 
@@ -340,11 +338,6 @@ struct PendingFetch {
     abort: AbortHandle,
 }
 
-struct RefreshState {
-    generation: Generation,
-    refresh_in_flight: bool,
-}
-
 impl PendingFetch {
     fn future(&self) -> PendingFuture {
         self.future.clone()
@@ -364,7 +357,6 @@ pub(crate) struct Entry {
     current: AtomicU64,
     epoch: Instant,
     pending: ArcSwapOption<PendingFetch>,
-    refresh: Mutex<RefreshState>,
 }
 
 impl core::fmt::Debug for Entry {
@@ -388,10 +380,6 @@ impl Entry {
             current: AtomicU64::new(Self::word(EntryState::Pending, NO_EXPIRY)),
             epoch,
             pending: ArcSwapOption::from(Some(fetch)),
-            refresh: Mutex::new(RefreshState {
-                generation: Generation::new(()),
-                refresh_in_flight: false,
-            }),
         }
     }
 
@@ -455,19 +443,6 @@ impl Entry {
         }
     }
 
-    fn compare_exchange_authoritative(
-        &self,
-        current: EntryState,
-        new: EntryState,
-        deadline: u64,
-    ) -> Result<(), EntryState> {
-        let mut refresh = self.refresh.lock();
-        self.compare_exchange(current, new, deadline)?;
-        refresh.generation = Generation::new(());
-        refresh.refresh_in_flight = false;
-        Ok(())
-    }
-
     fn deadline_after(&self, now: Instant, ttl: Duration) -> u64 {
         if ttl == Duration::MAX {
             return NO_EXPIRY;
@@ -495,78 +470,6 @@ impl Entry {
     fn is_expired_at(&self, decision: u64, now: Instant) -> bool {
         let deadline = decision >> 2;
         deadline != NO_EXPIRY && self.tick(now) >= deadline
-    }
-
-    fn deadline_instant(&self, decision: u64) -> Option<Instant> {
-        let deadline = decision >> 2;
-        if deadline == NO_EXPIRY {
-            return None;
-        }
-        self.epoch.checked_add(Duration::from_nanos(deadline))
-    }
-
-    fn begin_refresh_if_due(
-        &self,
-        now: Instant,
-        freshness_ttl: Duration,
-        refresh_after: Duration,
-    ) -> Option<Generation> {
-        let mut refresh = self.refresh.lock();
-        let decision = self.current.load(Ordering::Acquire);
-        if !matches!(
-            decode_entry_state(decision),
-            EntryState::Allowed | EntryState::Denied
-        ) {
-            return None;
-        }
-        let fresh_until = self.deadline_instant(decision)?;
-        let refresh_at = fresh_until.checked_sub(freshness_ttl.checked_sub(refresh_after)?)?;
-        if now < refresh_at || now >= fresh_until || refresh.refresh_in_flight {
-            return None;
-        }
-        refresh.refresh_in_flight = true;
-        Some(Generation::clone(&refresh.generation))
-    }
-
-    fn apply_refresh_result<D: TimeDriver>(
-        &self,
-        generation: &Generation,
-        result: &FetchResult,
-        ttl: Duration,
-    ) {
-        let mut refresh = self.refresh.lock();
-        if !Generation::ptr_eq(&refresh.generation, generation) || !refresh.refresh_in_flight {
-            return;
-        }
-        refresh.refresh_in_flight = false;
-        let now = D::now();
-        let current = self.current.load(Ordering::Acquire);
-        if !matches!(
-            decode_entry_state(current),
-            EntryState::Allowed | EntryState::Denied
-        ) || self.is_expired_at(current, now)
-        {
-            return;
-        }
-        if let Ok(decision) = result {
-            self.current.store(
-                Self::word((*decision).into(), self.deadline_after(now, ttl)),
-                Ordering::Release,
-            );
-            refresh.generation = Generation::new(());
-        }
-    }
-
-    fn refresh_is_current<D: TimeDriver>(&self, generation: &Generation) -> bool {
-        let refresh = self.refresh.lock();
-        if !Generation::ptr_eq(&refresh.generation, generation) || !refresh.refresh_in_flight {
-            return false;
-        }
-        let current = self.current.load(Ordering::Acquire);
-        matches!(
-            decode_entry_state(current),
-            EntryState::Allowed | EntryState::Denied
-        ) && !self.is_expired_at(current, D::now())
     }
 
     fn pending_operation(&self) -> Option<Arc<PendingFetch>> {
@@ -614,7 +517,6 @@ impl Entry {
     }
 
     fn invalidate(&self) {
-        let mut refresh = self.refresh.lock();
         let mut previous = self.current.load(Ordering::Acquire);
         loop {
             let stale = (previous & !STATE_MASK) | EntryState::Stale as u64;
@@ -628,9 +530,6 @@ impl Entry {
                 Err(changed) => previous = changed,
             }
         }
-        refresh.generation = Generation::new(());
-        refresh.refresh_in_flight = false;
-        drop(refresh);
         self.abort_pending();
     }
 }
@@ -758,24 +657,6 @@ impl<T: Subject> SubjectMap<T> {
         }
     }
 
-    fn apply_if_current<R>(
-        &self,
-        subject: &T,
-        entry: &Arc<Entry>,
-        now: Instant,
-        apply: impl FnOnce() -> R,
-    ) -> Option<R> {
-        let mut entries = self.entries.lock();
-        self.evict(&mut entries, self.tick(now));
-        if !entries
-            .peek(subject)
-            .is_some_and(|slot| Arc::ptr_eq(&slot.entry, entry))
-        {
-            return None;
-        }
-        Some(apply())
-    }
-
     fn clear(&self) {
         let mut entries = self.entries.lock();
         for (_, slot) in entries.iter() {
@@ -817,8 +698,6 @@ struct PublishState {
     next_allowed: Instant,
 }
 
-pub(crate) type DecisionRefreshFuture = BoxFuture<'static, ()>;
-
 /// Owns authoritative subject state and its cached read snapshot.
 pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> {
     client: Arc<C>,
@@ -830,7 +709,6 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
-    refreshes: UnboundedSender<DecisionRefreshFuture>,
     config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
@@ -854,11 +732,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         metrics: M,
         _time: D,
         connected: Receiver<bool>,
-    ) -> (Arc<Self>, UnboundedReceiver<DecisionRefreshFuture>) {
+    ) -> Arc<Self> {
         let now = D::now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
-        let (refreshes, refresh_requests) = futures_channel::mpsc::unbounded();
-        let state = Arc::new(Self {
+        Arc::new(Self {
             client,
             connected,
             disconnected_since: Arc::new(Mutex::new(Some(now))),
@@ -874,12 +751,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 next_allowed: now,
             }),
             shape_dirty,
-            refreshes,
             config: *config,
             metrics,
             _time: PhantomData,
-        });
-        (state, refresh_requests)
+        })
     }
 
     /// Returns the total admission time budget.
@@ -908,13 +783,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 
     /// Reads subject state through the snapshot and records its map recency.
-    pub(crate) fn check(self: &Arc<Self>, subject: &T) -> Option<Admission<D>> {
+    pub(crate) fn check(&self, subject: &T) -> Option<Admission<D>> {
         let snapshot = self.snapshot.load();
         let entry = snapshot.get(subject)?;
         // Pending and stale entries read as snapshot misses.
         entry.verdict_at(D::now())?;
         self.subjects.touch(subject, entry, D::now());
-        self.admission_on_access(subject, Arc::clone(entry))
+        Entry::admission(Arc::clone(entry))
     }
 
     /// Resolves an authoritative subject verdict within the admission budget.
@@ -981,7 +856,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             let pending = match entry.state_at(D::now()) {
                 EntryState::Allowed | EntryState::Denied => {
                     self.metrics.map_hit();
-                    if let Some(admission) = self.admission_on_access(subject, entry) {
+                    if let Some(admission) = Entry::admission(entry) {
                         return Some(admission);
                     }
                     continue;
@@ -1029,7 +904,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                 Ok(Some(Err(Aborted)) | None) => continue,
                 Err(_) => {
                     // An authoritative transition may race the deadline notification.
-                    if let Some(admission) = self.admission_on_access(subject, entry) {
+                    if let Some(admission) = Entry::admission(entry) {
                         return Some(admission);
                     }
                     return self.admission_timed_out();
@@ -1040,7 +915,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
             }
             match entry.state_at(D::now()) {
                 EntryState::Allowed | EntryState::Denied => {
-                    if let Some(admission) = self.admission_on_access(subject, entry) {
+                    if let Some(admission) = Entry::admission(entry) {
                         return Some(admission);
                     }
                     continue;
@@ -1143,7 +1018,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         if let Ok(decision) = result {
             // A watch event that wins this CAS supplies the verdict that stands.
             if entry
-                .compare_exchange_authoritative(
+                .compare_exchange(
                     EntryState::Pending,
                     (*decision).into(),
                     self.decision_deadline(entry),
@@ -1188,99 +1063,6 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         None
     }
 
-    fn admission_on_access(
-        self: &Arc<Self>,
-        subject: &T,
-        entry: Arc<Entry>,
-    ) -> Option<Admission<D>> {
-        let admission = Entry::admission(Arc::clone(&entry))?;
-        self.refresh_on_access(subject, entry);
-        Some(admission)
-    }
-
-    fn refresh_on_access(self: &Arc<Self>, subject: &T, entry: Arc<Entry>) {
-        let refresh_after = self.config.decision_refresh_after();
-        if refresh_after == Duration::MAX {
-            return;
-        }
-        let Some(generation) = entry.begin_refresh_if_due(
-            D::now(),
-            self.config.decision_freshness_ttl(),
-            refresh_after,
-        ) else {
-            return;
-        };
-        let refresh = self.new_decision_refresh(subject.clone(), entry, generation);
-        let _ = self.refreshes.unbounded_send(refresh);
-    }
-
-    fn refresh_is_current(&self, subject: &T, entry: &Arc<Entry>, generation: &Generation) -> bool {
-        self.subjects
-            .apply_if_current(subject, entry, D::now(), || {
-                entry.refresh_is_current::<D>(generation)
-            })
-            .unwrap_or(false)
-    }
-
-    fn new_decision_refresh(
-        self: &Arc<Self>,
-        subject: T,
-        entry: Arc<Entry>,
-        generation: Generation,
-    ) -> DecisionRefreshFuture {
-        let client = Arc::clone(&self.client);
-        let metrics = self.metrics;
-        let unary_timeout = self.config.unary_timeout();
-        let gate = Arc::downgrade(self);
-        async move {
-            let Some(current_gate) = gate.upgrade() else {
-                return;
-            };
-            if !current_gate.refresh_is_current(&subject, &entry, &generation) {
-                return;
-            }
-            drop(current_gate);
-            metrics.unary_call();
-            let result = async {
-                let decision = D::timeout(unary_timeout, client.get_subject_decision(&subject))
-                    .await
-                    .map_err(|_| {
-                        DecisionSourceError::new(
-                            DecisionSourceErrorKind::Transient,
-                            "subject decision refresh timed out",
-                        )
-                    })??;
-                decision.ok_or_else(|| {
-                    DecisionSourceError::new(
-                        DecisionSourceErrorKind::Transient,
-                        "decision source holds no decision for the subject",
-                    )
-                })
-            }
-            .await;
-            if result
-                .as_ref()
-                .is_err_and(|error| error.kind() == DecisionSourceErrorKind::Wire)
-            {
-                metrics.wire_failure();
-            }
-            if result.is_err() {
-                metrics.unary_failure();
-            }
-            if let Some(gate) = gate.upgrade() {
-                gate.subjects
-                    .apply_if_current(&subject, &entry, D::now(), || {
-                        entry.apply_refresh_result::<D>(
-                            &generation,
-                            &result,
-                            gate.config.decision_freshness_ttl(),
-                        );
-                    });
-            }
-        }
-        .boxed()
-    }
-
     /// Marks the watch connected after clearing state from the prior connection.
     pub(crate) fn watch_connected(&self, connected: &Sender<bool>) {
         // Clear before publishing connected so no state from the old watch is served.
@@ -1323,7 +1105,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         EntryState::Stale => break,
                         current @ (EntryState::Pending
                         | EntryState::Allowed
-                        | EntryState::Denied) => match entry.compare_exchange_authoritative(
+                        | EntryState::Denied) => match entry.compare_exchange(
                             current,
                             next,
                             self.decision_deadline(&entry),
