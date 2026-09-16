@@ -479,10 +479,8 @@ where
 /// Middleware produced by [`PolicyGateLayer`].
 ///
 /// Its [`tower::Service`] implementation requires an inner service with `Error = Infallible`,
-/// because every policy outcome is an ordinary HTTP response. A request whose subject is already
-/// cached as allowed reaches the inner service through an unboxed future, with no await and, aside
-/// from request-body adaptation or a cache-eviction touch, no allocation; every other outcome
-/// resolves admission first.
+/// because every policy outcome is an ordinary HTTP response. Cached decisions are checked before
+/// the middleware waits for an authority lookup.
 ///
 /// Requires the `tower-layer` feature.
 pub struct PolicyGateMiddleware<
@@ -548,7 +546,6 @@ where
     }
 }
 
-// Snapshot-hit admissions stay unboxed; rejections and slow-path work may allocate.
 type LimitFuture<F, T, C, A, M, R, D> = Either<
     EnforcedResponseFuture<F, T, C, A, M, R, D>,
     BoxFuture<'static, Result<Response<<A as BodyAdapter>::Body>, Infallible>>,
@@ -591,30 +588,33 @@ where
                 .missing_subject(self.body, &self.context.missing_subject_message)))));
         };
 
-        if let Some(admission) = self.context.gate.try_cached(&subject) {
-            if admission.is_allowed() {
-                return Either::Left(pass_through(
-                    &mut self.inner,
-                    request,
-                    subject,
-                    admission,
-                    Arc::clone(&self.context),
-                    self.policy.as_ref(),
-                    ResponseContext {
-                        body: self.body,
-                        response: self.response,
-                    },
-                ));
+        let refresh_disabled = self.context.gate.refresh_disabled();
+        if refresh_disabled {
+            if let Some(admission) = self.context.gate.try_cached_now(&subject) {
+                if admission.is_allowed() {
+                    return Either::Left(pass_through(
+                        &mut self.inner,
+                        request,
+                        subject,
+                        admission,
+                        Arc::clone(&self.context),
+                        self.policy.as_ref(),
+                        ResponseContext {
+                            body: self.body,
+                            response: self.response,
+                        },
+                    ));
+                }
+                if admission.state() == AdmissionState::Denied {
+                    return Either::Right(Box::pin(ready(Ok(deny(
+                        &self.context,
+                        self.body,
+                        self.response,
+                    )))));
+                }
             }
-            if admission.state() == AdmissionState::Denied {
-                return Either::Right(Box::pin(ready(Ok(deny(
-                    &self.context,
-                    self.body,
-                    self.response,
-                )))));
-            }
+            self.context.metrics.snapshot_miss();
         }
-        self.context.metrics.snapshot_miss();
 
         // We must take the current `inner` and not the clone.
         // See: https://docs.rs/tower/latest/tower/trait.Service.html#be-careful-when-cloning-inner-services

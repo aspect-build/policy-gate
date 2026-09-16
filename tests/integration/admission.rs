@@ -584,6 +584,7 @@ async fn admission_reads_current_state_after_authority_changes() {
     let cached = runtime
         .gate
         .try_cached(&subject)
+        .await
         .expect("cached denial handle");
     assert!(!cached.is_allowed());
 

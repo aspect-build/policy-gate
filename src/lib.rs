@@ -643,6 +643,14 @@ impl PolicyGateConfigBuilder {
         if candidate.decision_freshness_ttl.is_zero() {
             return Err(ConfigError::DecisionFreshnessTtlZero);
         }
+        if !candidate.refresh_before_expiry.is_zero()
+            && candidate.decision_freshness_ttl == Duration::MAX
+        {
+            return Err(ConfigError::RefreshRequiresFiniteDecisionFreshnessTtl);
+        }
+        if candidate.refresh_before_expiry >= candidate.decision_freshness_ttl {
+            return Err(ConfigError::RefreshWindowNotLessThanDecisionFreshnessTtl);
+        }
         if candidate.decision_freshness_ttl != DEFAULT_DECISION_FRESHNESS_TTL
             && now.checked_add(candidate.decision_freshness_ttl).is_none()
         {
@@ -677,6 +685,10 @@ pub enum ConfigError {
     RefreshQueueCapacityZero,
     /// A zero freshness TTL would make every authoritative decision immediately unusable.
     DecisionFreshnessTtlZero,
+    /// Refresh needs a finite freshness deadline to define its trigger window.
+    RefreshRequiresFiniteDecisionFreshnessTtl,
+    /// Refresh must start strictly before the freshness deadline.
+    RefreshWindowNotLessThanDecisionFreshnessTtl,
 }
 
 impl fmt::Display for ConfigError {
@@ -712,6 +724,12 @@ impl fmt::Display for ConfigError {
             }
             Self::DecisionFreshnessTtlZero => {
                 f.write_str("decision freshness TTL must be greater than zero")
+            }
+            Self::RefreshRequiresFiniteDecisionFreshnessTtl => {
+                f.write_str("decision refresh requires a finite decision freshness TTL")
+            }
+            Self::RefreshWindowNotLessThanDecisionFreshnessTtl => {
+                f.write_str("decision refresh window must be less than decision freshness TTL")
             }
         }
     }

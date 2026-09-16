@@ -94,17 +94,24 @@ where
             // Recheck on every body poll. No change observer wakes an idle connection.
             match this.admission.observe() {
                 Observed::Allowed => {
-                    return poll_inner_terminal(this.inner.as_mut(), cx, this.ended);
+                    return poll_inner_terminal(
+                        this.inner.as_mut(),
+                        cx,
+                        this.ended,
+                        this.readmission,
+                    );
                 }
                 Observed::Denied | Observed::Expired => break,
                 Observed::Stale => {
-                    if let Some(admission) = this.context.gate.try_cached(this.subject) {
-                        *this.readmission = None;
+                    if let Some(admission) = this.context.gate.try_cached_now(this.subject) {
                         if admission.is_allowed() {
-                            *this.admission = admission;
-                            continue;
-                        }
-                        if admission.state() == AdmissionState::Denied {
+                            if this.context.gate.refresh_disabled() {
+                                *this.readmission = None;
+                                *this.admission = admission;
+                                continue;
+                            }
+                        } else if admission.state() == AdmissionState::Denied {
+                            *this.readmission = None;
                             break;
                         }
                     }
@@ -143,12 +150,18 @@ where
                             }
                         }
                     }
-                    return poll_inner_terminal(this.inner.as_mut(), cx, this.ended);
+                    return poll_inner_terminal(
+                        this.inner.as_mut(),
+                        cx,
+                        this.ended,
+                        this.readmission,
+                    );
                 }
             }
         }
 
         *this.ended = true;
+        *this.readmission = None;
         this.context.metrics.stream_cutoff();
         match this
             .response
@@ -173,10 +186,11 @@ where
     }
 }
 
-fn poll_inner_terminal<B: Body>(
+fn poll_inner_terminal<B: Body, F>(
     inner: Pin<&mut B>,
     cx: &mut Context<'_>,
     ended: &mut bool,
+    readmission: &mut Option<F>,
 ) -> Poll<Option<Result<Frame<B::Data>, BoxBodyError>>>
 where
     B::Error: Into<BoxBodyError>,
@@ -184,11 +198,13 @@ where
     match inner.poll_frame(cx) {
         Poll::Ready(None) => {
             *ended = true;
+            *readmission = None;
             Poll::Ready(None)
         }
         Poll::Ready(Some(Ok(frame))) => {
             if frame.is_trailers() {
                 *ended = true;
+                *readmission = None;
             }
             Poll::Ready(Some(Ok(frame)))
         }

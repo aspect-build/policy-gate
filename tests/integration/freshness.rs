@@ -73,16 +73,17 @@ async fn ordinary_access_does_not_extend_the_absolute_deadline() {
         runtime
             .gate
             .try_cached(&subject)
+            .await
             .expect("decision remains fresh"),
     );
     runtime.time.advance(Duration::from_millis(29)).await;
-    assert!(runtime.gate.try_cached(&subject).is_some());
+    assert!(runtime.gate.try_cached(&subject).await.is_some());
     runtime.time.advance(Duration::from_millis(1)).await;
 
     assert!(!admission.is_allowed());
     assert_eq!(admission.state(), AdmissionState::Stale);
     assert!(
-        runtime.gate.try_cached(&subject).is_none(),
+        runtime.gate.try_cached(&subject).await.is_none(),
         "ordinary access does not extend absolute freshness"
     );
     drop(admit_allowed(&runtime, SUBJECT_A).await);
@@ -109,7 +110,7 @@ async fn denied_decision_expires_and_is_refetched() {
 
     runtime.time.advance(Duration::from_millis(100)).await;
 
-    assert!(runtime.gate.try_cached(&subject).is_none());
+    assert!(runtime.gate.try_cached(&subject).await.is_none());
     drop(admit_allowed(&runtime, SUBJECT_A).await);
     assert_eq!(source.get_calls(), 2);
     runtime.stop().await;
@@ -160,6 +161,7 @@ async fn subject_ttl_remains_sliding_and_can_expire_first() {
         runtime
             .gate
             .try_cached(&first)
+            .await
             .expect("access renews idle age"),
     );
     runtime.time.advance(Duration::from_millis(40)).await;
@@ -172,6 +174,7 @@ async fn subject_ttl_remains_sliding_and_can_expire_first() {
         runtime
             .gate
             .try_cached(&second)
+            .await
             .expect("second subject is cached"),
     );
 

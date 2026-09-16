@@ -309,7 +309,7 @@ async fn dropping_the_watcher_marks_handles_stale_synchronously() {
     drop(watcher);
 
     assert_eq!(admission.state(), policy_gate::AdmissionState::Stale);
-    assert!(gate.try_cached(&subject).is_none());
+    assert!(gate.try_cached(&subject).await.is_none());
 }
 
 #[tokio::test]
