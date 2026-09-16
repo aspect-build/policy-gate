@@ -73,8 +73,8 @@ impl<D: TimeDriver> DecisionSourceHealth<D> {
 ///
 /// The watcher is a future that never completes: it keeps the decision source's change stream
 /// open, applies each change to the gate's cache, and reopens the stream with jittered backoff
-/// after any failure. When refresh-ahead is configured, it also runs refreshes requested by cache
-/// reads. Poll it for the lifetime of the gate, normally with `tokio::spawn`.
+/// after any failure. It also runs refreshes requested by cache reads. Poll it for the lifetime of
+/// the gate, normally with `tokio::spawn`.
 ///
 /// Unary lookups and cache maintenance also mutate gate state, but only the watcher can supply or
 /// refresh an authoritative verdict, so its progress is a hard requirement rather than an
@@ -104,7 +104,7 @@ impl DecisionWatcher {
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
-        refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture>>,
+        refresh_requests: UnboundedReceiver<DecisionRefreshFuture>,
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
@@ -148,7 +148,7 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
     lease: WatchLease<T, C, M, D>,
     client: Arc<C>,
     metrics: M,
-    mut refresh_requests: Option<UnboundedReceiver<DecisionRefreshFuture>>,
+    mut refresh_requests: UnboundedReceiver<DecisionRefreshFuture>,
 ) {
     let initial_reconnect_delay = lease.state.initial_reconnect_delay();
     let max_reconnect_delay = lease.state.max_reconnect_delay();
@@ -163,26 +163,15 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
         match opened {
             Ok(Ok(stream)) => {
                 lease.state.watch_connected(&lease.connected);
-                let stable = if let Some(refresh_requests) = refresh_requests.as_mut() {
-                    watch_connected_with_refresh::<T, C, M, D>(
-                        Arc::clone(&lease.state),
-                        stream,
-                        metrics,
-                        max_reconnect_delay,
-                        watch_events_per_yield,
-                        refresh_requests,
-                    )
-                    .await
-                } else {
-                    watch_connected::<T, C, M, D>(
-                        Arc::clone(&lease.state),
-                        stream,
-                        metrics,
-                        max_reconnect_delay,
-                        watch_events_per_yield,
-                    )
-                    .await
-                };
+                let stable = watch_connected::<T, C, M, D>(
+                    Arc::clone(&lease.state),
+                    stream,
+                    metrics,
+                    max_reconnect_delay,
+                    watch_events_per_yield,
+                    &mut refresh_requests,
+                )
+                .await;
                 if stable {
                     reconnect_delay = initial_reconnect_delay;
                 }
@@ -208,45 +197,6 @@ async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D:
 }
 
 async fn watch_connected<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver>(
-    state: Arc<GateState<T, C, M, D>>,
-    stream: C::Changes,
-    metrics: M,
-    stability_delay: Duration,
-    events_per_yield: usize,
-) -> bool {
-    let stream = stream.fuse();
-    let stable_timer = D::sleep(stability_delay).fuse();
-    futures_util::pin_mut!(stream, stable_timer);
-    let mut stable = false;
-    let mut events_since_yield = 0;
-    loop {
-        let item = futures_util::select! {
-            () = stable_timer => {
-                stable = true;
-                state.watch_stable();
-                continue;
-            },
-            item = stream.next() => item,
-        };
-        let Some(change) = decode_watch_item(item, metrics) else {
-            return stable;
-        };
-        state.apply_change(&change);
-        metrics.watch_event();
-        events_since_yield += 1;
-        if events_since_yield == events_per_yield {
-            events_since_yield = 0;
-            D::yield_now().await;
-        }
-    }
-}
-
-async fn watch_connected_with_refresh<
-    T: Subject,
-    C: DecisionSource<T>,
-    M: PolicyGateMetrics,
-    D: TimeDriver,
->(
     state: Arc<GateState<T, C, M, D>>,
     stream: C::Changes,
     metrics: M,

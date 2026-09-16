@@ -28,7 +28,7 @@ fn freshness_config() -> ConfigOptions {
 fn refresh_config() -> ConfigOptions {
     ConfigOptions {
         decision_freshness_ttl: Duration::from_millis(100),
-        decision_refresh_ahead: Some(Duration::from_millis(20)),
+        decision_refresh_after: Duration::from_millis(80),
         ..ConfigOptions::default()
     }
 }

@@ -372,7 +372,7 @@ pub(crate) struct Entry {
     current: AtomicU64,
     epoch: Instant,
     pending: ArcSwapOption<PendingFetch>,
-    refresh: Option<Mutex<RefreshState>>,
+    refresh: Mutex<RefreshState>,
 }
 
 impl core::fmt::Debug for Entry {
@@ -391,16 +391,14 @@ const NO_EXPIRY: u64 = (1_u64 << 62) - 1;
 const MAX_FINITE_DEADLINE: u64 = NO_EXPIRY - 1;
 
 impl Entry {
-    fn pending(epoch: Instant, fetch: Arc<PendingFetch>, refresh_enabled: bool) -> Self {
+    fn pending(epoch: Instant, fetch: Arc<PendingFetch>) -> Self {
         Self {
             current: AtomicU64::new(Self::word(EntryState::Pending, NO_EXPIRY)),
             epoch,
             pending: ArcSwapOption::from(Some(fetch)),
-            refresh: refresh_enabled.then(|| {
-                Mutex::new(RefreshState {
-                    generation: Generation::new(()),
-                    refresh_in_flight: false,
-                })
+            refresh: Mutex::new(RefreshState {
+                generation: Generation::new(()),
+                refresh_in_flight: false,
             }),
         }
     }
@@ -471,10 +469,7 @@ impl Entry {
         new: EntryState,
         deadline: u64,
     ) -> Result<(), EntryState> {
-        let Some(refresh) = &self.refresh else {
-            return self.compare_exchange(current, new, deadline);
-        };
-        let mut refresh = refresh.lock();
+        let mut refresh = self.refresh.lock();
         self.compare_exchange(current, new, deadline)?;
         refresh.generation = Generation::new(());
         refresh.refresh_in_flight = false;
@@ -518,12 +513,13 @@ impl Entry {
         self.epoch.checked_add(Duration::from_nanos(deadline))
     }
 
-    fn begin_refresh_if_due(&self, now: Instant, refresh_ahead: Duration) -> Option<Generation> {
-        let mut refresh = self
-            .refresh
-            .as_ref()
-            .expect("refresh work exists only when configured")
-            .lock();
+    fn begin_refresh_if_due(
+        &self,
+        now: Instant,
+        freshness_ttl: Duration,
+        refresh_after: Duration,
+    ) -> Option<Generation> {
+        let mut refresh = self.refresh.lock();
         let decision = self.current.load(Ordering::Acquire);
         if !matches!(
             decode_entry_state(decision),
@@ -532,7 +528,7 @@ impl Entry {
             return None;
         }
         let fresh_until = self.deadline_instant(decision)?;
-        let refresh_at = fresh_until.checked_sub(refresh_ahead)?;
+        let refresh_at = fresh_until.checked_sub(freshness_ttl.checked_sub(refresh_after)?)?;
         if now < refresh_at || now >= fresh_until || refresh.refresh_in_flight {
             return None;
         }
@@ -546,11 +542,7 @@ impl Entry {
         result: &FetchResult,
         ttl: Duration,
     ) {
-        let mut refresh = self
-            .refresh
-            .as_ref()
-            .expect("refresh results exist only when configured")
-            .lock();
+        let mut refresh = self.refresh.lock();
         if !Generation::ptr_eq(&refresh.generation, generation) || !refresh.refresh_in_flight {
             return;
         }
@@ -574,11 +566,7 @@ impl Entry {
     }
 
     fn refresh_is_current<D: TimeDriver>(&self, generation: &Generation) -> bool {
-        let refresh = self
-            .refresh
-            .as_ref()
-            .expect("refresh work exists only when configured")
-            .lock();
+        let refresh = self.refresh.lock();
         if !Generation::ptr_eq(&refresh.generation, generation) || !refresh.refresh_in_flight {
             return false;
         }
@@ -634,7 +622,7 @@ impl Entry {
     }
 
     fn invalidate(&self) {
-        let mut refresh = self.refresh.as_ref().map(Mutex::lock);
+        let mut refresh = self.refresh.lock();
         let mut previous = self.current.load(Ordering::Acquire);
         loop {
             let stale = (previous & !STATE_MASK) | EntryState::Stale as u64;
@@ -648,10 +636,8 @@ impl Entry {
                 Err(changed) => previous = changed,
             }
         }
-        if let Some(refresh) = refresh.as_mut() {
-            refresh.generation = Generation::new(());
-            refresh.refresh_in_flight = false;
-        }
+        refresh.generation = Generation::new(());
+        refresh.refresh_in_flight = false;
         drop(refresh);
         self.abort_pending();
     }
@@ -852,7 +838,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
-    refreshes: Option<UnboundedSender<DecisionRefreshFuture>>,
+    refreshes: UnboundedSender<DecisionRefreshFuture>,
     config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
@@ -876,14 +862,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         metrics: M,
         _time: D,
         connected: Receiver<bool>,
-    ) -> (Arc<Self>, Option<UnboundedReceiver<DecisionRefreshFuture>>) {
+    ) -> (Arc<Self>, UnboundedReceiver<DecisionRefreshFuture>) {
         let now = D::now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
-        let (refreshes, refresh_requests) =
-            config.decision_refresh_ahead().map_or((None, None), |_| {
-                let (sender, receiver) = futures_channel::mpsc::unbounded();
-                (Some(sender), Some(receiver))
-            });
+        let (refreshes, refresh_requests) = futures_channel::mpsc::unbounded();
         let state = Arc::new(Self {
             client,
             connected,
@@ -980,7 +962,6 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                     Entry::pending(
                         now,
                         self.new_fetch_after(entry.clone(), subject.clone(), None),
-                        self.refreshes.is_some(),
                     )
                 })
             });
@@ -1226,18 +1207,19 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     }
 
     fn refresh_on_access(self: &Arc<Self>, subject: &T, entry: Arc<Entry>) {
-        let Some(refresh_ahead) = self.config.decision_refresh_ahead() else {
+        let refresh_after = self.config.decision_refresh_after();
+        if refresh_after == Duration::MAX {
             return;
-        };
-        let Some(generation) = entry.begin_refresh_if_due(D::now(), refresh_ahead) else {
+        }
+        let Some(generation) = entry.begin_refresh_if_due(
+            D::now(),
+            self.config.decision_freshness_ttl(),
+            refresh_after,
+        ) else {
             return;
         };
         let refresh = self.new_decision_refresh(subject.clone(), entry, generation);
-        let _ = self
-            .refreshes
-            .as_ref()
-            .expect("refresh sender exists when refresh-ahead is configured")
-            .unbounded_send(refresh);
+        let _ = self.refreshes.unbounded_send(refresh);
     }
 
     fn refresh_is_current(&self, subject: &T, entry: &Arc<Entry>, generation: &Generation) -> bool {

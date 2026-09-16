@@ -26,9 +26,9 @@
 //! Absolute decision freshness is opt-in. A finite freshness TTL enables it; the default
 //! [`DEFAULT_DECISION_FRESHNESS_TTL`] sentinel never expires. When enabled, ordinary cache access
 //! never extends a decision's deadline. Handles and admissions check expiry on access; stream bodies
-//! cut off expired decisions on their next poll. An optional refresh-ahead setting starts one
-//! background refresh when a cached decision is read inside its refresh window. Time alone never
-//! wakes an idle stream.
+//! cut off expired decisions on their next poll. A finite refresh age starts one background
+//! refresh when a cached decision is read after reaching that age. Time alone never wakes an idle
+//! stream.
 //! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
 //!
 //! # Example
@@ -228,6 +228,10 @@ pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(3_600);
 ///
 /// This exact value is the never-expire sentinel; the runtime does not turn it into a deadline.
 pub const DEFAULT_DECISION_FRESHNESS_TTL: Duration = Duration::MAX;
+/// Default [`PolicyGateConfigBuilder::decision_refresh_after`].
+///
+/// This exact value is the never-refresh sentinel.
+pub const DEFAULT_DECISION_REFRESH_AFTER: Duration = Duration::MAX;
 
 /// Authoritative decision returned for one subject.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,7 +327,7 @@ pub struct PolicyGateConfig {
     max_subjects: usize,
     subject_ttl: Duration,
     decision_freshness_ttl: Duration,
-    decision_refresh_ahead: Option<Duration>,
+    decision_refresh_after: Duration,
 }
 
 impl PolicyGateConfig {
@@ -344,7 +348,7 @@ impl PolicyGateConfig {
                 max_subjects: DEFAULT_MAX_SUBJECTS,
                 subject_ttl: DEFAULT_SUBJECT_TTL,
                 decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
-                decision_refresh_ahead: None,
+                decision_refresh_after: DEFAULT_DECISION_REFRESH_AFTER,
             },
         }
     }
@@ -435,20 +439,20 @@ impl PolicyGateConfig {
     /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
     /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
     /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
-    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_ahead`] to refresh cached
+    /// Pair a finite TTL with [`PolicyGateConfig::decision_refresh_after`] to refresh cached
     /// decisions on access before this deadline.
     #[must_use]
     pub const fn decision_freshness_ttl(&self) -> Duration {
         self.decision_freshness_ttl
     }
 
-    /// How long before freshness expiry a cached subject read starts a background refresh.
+    /// Decision age after which a cached subject read starts a background refresh.
     ///
-    /// `None` disables proactive refresh while allowing absolute expiry to remain enabled. A value
-    /// requires a finite [`PolicyGateConfig::decision_freshness_ttl`].
+    /// [`DEFAULT_DECISION_REFRESH_AFTER`] disables background refresh. Any other value requires a
+    /// finite [`PolicyGateConfig::decision_freshness_ttl`] and must be less than that TTL.
     #[must_use]
-    pub const fn decision_refresh_ahead(&self) -> Option<Duration> {
-        self.decision_refresh_ahead
+    pub const fn decision_refresh_after(&self) -> Duration {
+        self.decision_refresh_after
     }
 }
 
@@ -554,13 +558,13 @@ impl PolicyGateConfigBuilder {
         self
     }
 
-    /// Sets how long before decision freshness expiry a cached decision read triggers a refresh.
+    /// Sets the decision age after which a cached decision read triggers a refresh.
     ///
     /// This requires a finite [`PolicyGateConfigBuilder::decision_freshness_ttl`] and must be
     /// strictly less than that TTL.
     #[must_use]
-    pub const fn decision_refresh_ahead(mut self, refresh_ahead: Duration) -> Self {
-        self.candidate.decision_refresh_ahead = Some(refresh_ahead);
+    pub const fn decision_refresh_after(mut self, refresh_after: Duration) -> Self {
+        self.candidate.decision_refresh_after = refresh_after;
         self
     }
 
@@ -629,16 +633,16 @@ impl PolicyGateConfigBuilder {
         {
             return Err(ConfigError::DurationOverflow("decision freshness TTL"));
         }
-        match candidate.decision_refresh_ahead {
-            None => {}
-            Some(_) if candidate.decision_freshness_ttl == DEFAULT_DECISION_FRESHNESS_TTL => {
-                return Err(ConfigError::DecisionFreshnessIncomplete);
+        match candidate.decision_refresh_after {
+            DEFAULT_DECISION_REFRESH_AFTER => {}
+            _ if candidate.decision_freshness_ttl == DEFAULT_DECISION_FRESHNESS_TTL => {
+                return Err(ConfigError::DecisionRefreshAfterRequiresFiniteTtl);
             }
-            Some(refresh_ahead) if refresh_ahead.is_zero() => {
-                return Err(ConfigError::DecisionRefreshAheadZero);
+            refresh_after if refresh_after.is_zero() => {
+                return Err(ConfigError::DecisionRefreshAfterZero);
             }
-            Some(refresh_ahead) if refresh_ahead < candidate.decision_freshness_ttl => {}
-            Some(_) => return Err(ConfigError::DecisionRefreshAheadNotLessThanTtl),
+            refresh_after if refresh_after < candidate.decision_freshness_ttl => {}
+            _ => return Err(ConfigError::DecisionRefreshAfterNotLessThanTtl),
         }
         Ok(candidate)
     }
@@ -667,12 +671,12 @@ pub enum ConfigError {
     MaxSubjectsZero,
     /// A zero freshness TTL would make every authoritative decision immediately unusable.
     DecisionFreshnessTtlZero,
-    /// Refresh-ahead was configured while absolute freshness remained disabled.
-    DecisionFreshnessIncomplete,
-    /// A zero refresh-ahead interval would refresh at the freshness deadline.
-    DecisionRefreshAheadZero,
-    /// Refresh-ahead must leave a nonzero authoritative window before expiry.
-    DecisionRefreshAheadNotLessThanTtl,
+    /// A finite refresh age requires a finite absolute freshness TTL.
+    DecisionRefreshAfterRequiresFiniteTtl,
+    /// A zero refresh age would refresh every newly read decision immediately.
+    DecisionRefreshAfterZero,
+    /// Refresh age must leave a nonzero window before expiry.
+    DecisionRefreshAfterNotLessThanTtl,
 }
 
 impl fmt::Display for ConfigError {
@@ -706,14 +710,14 @@ impl fmt::Display for ConfigError {
             Self::DecisionFreshnessTtlZero => {
                 f.write_str("decision freshness TTL must be greater than zero")
             }
-            Self::DecisionFreshnessIncomplete => {
-                f.write_str("decision refresh-ahead requires a finite freshness TTL")
+            Self::DecisionRefreshAfterRequiresFiniteTtl => {
+                f.write_str("decision refresh age requires a finite freshness TTL")
             }
-            Self::DecisionRefreshAheadZero => {
-                f.write_str("decision refresh-ahead must be greater than zero")
+            Self::DecisionRefreshAfterZero => {
+                f.write_str("decision refresh age must be greater than zero")
             }
-            Self::DecisionRefreshAheadNotLessThanTtl => {
-                f.write_str("decision refresh-ahead must be less than the freshness TTL")
+            Self::DecisionRefreshAfterNotLessThanTtl => {
+                f.write_str("decision refresh age must be less than the freshness TTL")
             }
         }
     }
