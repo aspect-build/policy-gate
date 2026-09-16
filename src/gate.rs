@@ -11,12 +11,12 @@ use std::time::Instant;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_watch::{Receiver, Sender};
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use futures_util::FutureExt;
 use futures_util::future::{AbortHandle, Abortable, Aborted, BoxFuture, Shared};
 use lru::LruCache;
 use parking_lot::Mutex;
+use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 
 use crate::metrics::{NoopPolicyGateMetrics, PolicyGateMetrics};
 use crate::time::{TimeDriver, TimeoutElapsed, TokioTimeDriver};
@@ -248,10 +248,17 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
         time: D,
     ) -> crate::PolicyGateParts<T, C, M, D> {
         let (connected, connectivity) = async_watch::channel(false);
+        let refresh_queue_capacity = config.refresh_queue_capacity();
         let (state, refresh_rx) =
             GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
-        let (watcher, health) =
-            DecisionWatcher::new(Arc::clone(&state), client, metrics, connected, refresh_rx);
+        let (watcher, health) = DecisionWatcher::new(
+            Arc::clone(&state),
+            client,
+            metrics,
+            connected,
+            refresh_rx,
+            refresh_queue_capacity,
+        );
         (Self { state, metrics }, watcher, health)
     }
 
@@ -711,7 +718,7 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T>, M: PolicyGateMetri
     /// before a clear, and `connected` rejects rebuilds that started during one.
     publish: Mutex<PublishState>,
     shape_dirty: Arc<AtomicBool>,
-    refresh_tx: UnboundedSender<PendingFuture>,
+    refresh_tx: MpscSender<PendingFuture>,
     config: PolicyGateConfig,
     metrics: M,
     _time: PhantomData<D>,
@@ -735,10 +742,10 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         metrics: M,
         _time: D,
         connected: Receiver<bool>,
-    ) -> (Arc<Self>, UnboundedReceiver<PendingFuture>) {
+    ) -> (Arc<Self>, MpscReceiver<PendingFuture>) {
         let now = D::now();
         let shape_dirty = Arc::new(AtomicBool::new(false));
-        let (refresh_tx, refresh_rx) = futures_channel::mpsc::unbounded();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(config.refresh_queue_capacity());
         let state = Arc::new(Self {
             client,
             connected,
@@ -1121,7 +1128,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         .compare_and_swap(&None::<Arc<PendingFetch>>, Some(Arc::clone(&refresh)))
                         .is_none()
                     {
-                        if self.refresh_tx.unbounded_send(refresh.future()).is_err() {
+                        if self.refresh_tx.try_send(refresh.future()).is_err() {
                             entry.abort_pending();
                         }
                     } else {

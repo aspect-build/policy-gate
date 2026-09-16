@@ -518,7 +518,6 @@ dependencies = [
  "axum",
  "axum-core",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "http",

@@ -230,6 +230,8 @@ pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(3_600);
 pub const DEFAULT_DECISION_FRESHNESS_TTL: Duration = Duration::MAX;
 /// Default [`PolicyGateConfigBuilder::refresh_before_expiry`].
 pub const DEFAULT_REFRESH_BEFORE_EXPIRY: Duration = Duration::ZERO;
+/// Number of background decision refreshes that may wait for the watcher.
+pub const DEFAULT_REFRESH_QUEUE_CAPACITY: usize = 1_024;
 
 /// Authoritative decision returned for one subject.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,6 +328,7 @@ pub struct PolicyGateConfig {
     subject_ttl: Duration,
     decision_freshness_ttl: Duration,
     refresh_before_expiry: Duration,
+    refresh_queue_capacity: usize,
 }
 
 impl PolicyGateConfig {
@@ -347,6 +350,7 @@ impl PolicyGateConfig {
                 subject_ttl: DEFAULT_SUBJECT_TTL,
                 decision_freshness_ttl: DEFAULT_DECISION_FRESHNESS_TTL,
                 refresh_before_expiry: DEFAULT_REFRESH_BEFORE_EXPIRY,
+                refresh_queue_capacity: DEFAULT_REFRESH_QUEUE_CAPACITY,
             },
         }
     }
@@ -449,6 +453,12 @@ impl PolicyGateConfig {
     #[must_use]
     pub const fn refresh_before_expiry(&self) -> Duration {
         self.refresh_before_expiry
+    }
+
+    /// Maximum number of decision refreshes waiting for the background watcher.
+    #[must_use]
+    pub const fn refresh_queue_capacity(&self) -> usize {
+        self.refresh_queue_capacity
     }
 }
 
@@ -562,6 +572,14 @@ impl PolicyGateConfigBuilder {
         self
     }
 
+    /// Sets the decision refresh queue capacity. Defaults to
+    /// [`DEFAULT_REFRESH_QUEUE_CAPACITY`].
+    #[must_use]
+    pub const fn refresh_queue_capacity(mut self, capacity: usize) -> Self {
+        self.candidate.refresh_queue_capacity = capacity;
+        self
+    }
+
     /// Normalizes fields and checks cross-field rules.
     ///
     /// # Errors
@@ -619,6 +637,9 @@ impl PolicyGateConfigBuilder {
         if candidate.max_subjects == 0 {
             return Err(ConfigError::MaxSubjectsZero);
         }
+        if candidate.refresh_queue_capacity == 0 {
+            return Err(ConfigError::RefreshQueueCapacityZero);
+        }
         if candidate.decision_freshness_ttl.is_zero() {
             return Err(ConfigError::DecisionFreshnessTtlZero);
         }
@@ -652,6 +673,8 @@ pub enum ConfigError {
     DurationOverflow(&'static str),
     /// The subject-map capacity is zero, so no subject could ever be cached.
     MaxSubjectsZero,
+    /// The refresh queue capacity is zero, so no background lookup could be scheduled.
+    RefreshQueueCapacityZero,
     /// A zero freshness TTL would make every authoritative decision immediately unusable.
     DecisionFreshnessTtlZero,
 }
@@ -684,6 +707,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "{name} is too large to represent as an Instant deadline")
             }
             Self::MaxSubjectsZero => f.write_str("maximum subject count must be greater than zero"),
+            Self::RefreshQueueCapacityZero => {
+                f.write_str("refresh queue capacity must be greater than zero")
+            }
             Self::DecisionFreshnessTtlZero => {
                 f.write_str("decision freshness TTL must be greater than zero")
             }
