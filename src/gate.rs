@@ -488,12 +488,6 @@ impl Entry {
             .is_some_and(|current| Arc::ptr_eq(&current, pending))
     }
 
-    fn install_pending(&self, pending: Arc<PendingFetch>) -> bool {
-        self.pending
-            .compare_and_swap(&None::<Arc<PendingFetch>>, Some(pending))
-            .is_none()
-    }
-
     fn replace_pending(
         &self,
         generation: &Generation,
@@ -1122,7 +1116,11 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         None,
                         Some(current),
                     );
-                    if entry.install_pending(Arc::clone(&refresh)) {
+                    if entry
+                        .pending
+                        .compare_and_swap(&None::<Arc<PendingFetch>>, Some(Arc::clone(&refresh)))
+                        .is_none()
+                    {
                         if self.refreshes.unbounded_send(refresh.future()).is_err() {
                             entry.abort_pending();
                         }
