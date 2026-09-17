@@ -100,7 +100,9 @@ pub enum AdmissionState {
 /// is what lets long-running work react to a later denial. It holds no capacity and does not keep
 /// its subject cached: eviction or a watch failure moves it to [`AdmissionState::Stale`].
 ///
-/// Read [`Admission::state`] or [`Admission::is_allowed`] before each activity. Authority changes
+/// Read [`Admission::state`], [`Admission::is_allowed`], or [`Admission::check`] before each activity.
+/// `check` also reports when refresh is due; call [`PolicyGate::refresh`] to start that work.
+/// These synchronous checks never start a lookup. Authority changes
 /// update the shared entry but never wake a handle; admission lookups coordinate through
 /// [`PolicyGate::admit`].
 /// Its default type parameter is [`TokioTimeDriver`]; the parameter selects a clock domain and
@@ -130,6 +132,30 @@ impl<D: TimeDriver> Admission<D> {
             Observed::Denied => AdmissionState::Denied,
             Observed::Expired | Observed::Stale => AdmissionState::Stale,
         }
+    }
+
+    /// Returns the current state and whether a background refresh should start now.
+    ///
+    /// This only observes state: it does not enqueue work or renew the idle cache TTL.
+    /// The signal stays true until a refresh claims the entry. Call [`PolicyGate::refresh`]
+    /// and keep at most one such task in flight per stream. Pending refreshes, failure
+    /// cooldowns, disabled refresh windows, and expired decisions report false.
+    #[must_use]
+    pub fn check(&self) -> (AdmissionState, bool) {
+        let now = D::now();
+        let (current, expired) = self.entry.current_at(now);
+        if expired {
+            return (AdmissionState::Stale, false);
+        }
+        let state = match decode_entry_state(current) {
+            EntryState::Allowed => AdmissionState::Allowed,
+            EntryState::Denied => AdmissionState::Denied,
+            EntryState::Stale => AdmissionState::Stale,
+            EntryState::Pending => {
+                unreachable!("an admission is created only from an authoritative state")
+            }
+        };
+        (state, self.entry.refresh_due_at(current, now))
     }
 
     /// Returns whether the current decision is allowed, authoritative, and unexpired.
@@ -292,6 +318,26 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Poli
         self.state.admit(subject).await.ok_or(AdmissionUnavailable)
     }
 
+    /// Hands a due refresh for this admission to the background watcher.
+    ///
+    /// The returned future performs no authority I/O and waits at most
+    /// [`PolicyGateConfig::refresh_enqueue_timeout`] for queue capacity. The caller may spawn
+    /// it to keep stream events synchronous; the library never spawns it. Concurrent refreshes
+    /// of the same entry start at most one lookup. Successful refreshes renew the retained handle in place.
+    ///
+    /// A mismatched subject, an admission from another gate, or a replaced entry is a no-op.
+    /// A matching entry's idle cache TTL is renewed even outside the refresh window.
+    /// Expired or stale decisions are not refreshed; readmit the subject instead.
+    /// Dropping the future while it waits for queue capacity safely releases its claim.
+    pub fn refresh(
+        &self,
+        subject: T,
+        admission: Admission<D>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let state = Arc::clone(&self.state);
+        async move { state.refresh_entry(&subject, &admission.entry).await }
+    }
+
     /// Returns a copy of the caller-provided metrics handle.
     #[must_use]
     pub const fn metrics(&self) -> M {
@@ -389,7 +435,13 @@ pub(crate) struct Entry {
     current: AtomicU64,
     epoch: Instant,
     pending: ArcSwapOption<PendingFetch>,
+    refresh_before: u64,
+    refresh_not_before: AtomicU64,
 }
+
+const _: () = assert!(core::mem::size_of::<Entry>() == 128);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<Admission<TokioTimeDriver>>() == 8);
 
 impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -407,11 +459,13 @@ const NO_EXPIRY: u64 = (1_u64 << 62) - 1;
 const MAX_FINITE_DEADLINE: u64 = NO_EXPIRY - 1;
 
 impl Entry {
-    fn pending(epoch: Instant, fetch: Arc<PendingFetch>) -> Self {
+    fn pending(epoch: Instant, fetch: Arc<PendingFetch>, refresh_before: Duration) -> Self {
         Self {
             current: AtomicU64::new(Self::word(EntryState::Pending, NO_EXPIRY)),
             epoch,
             pending: ArcSwapOption::from(Some(fetch)),
+            refresh_before: u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX),
+            refresh_not_before: AtomicU64::new(0),
         }
     }
 
@@ -502,6 +556,26 @@ impl Entry {
     fn is_expired_at(&self, decision: u64, now: Instant) -> bool {
         let deadline = decision >> 2;
         deadline != NO_EXPIRY && self.tick(now) >= deadline
+    }
+
+    fn refresh_due_at(&self, current: u64, now: Instant) -> bool {
+        self.refresh_eligible_at(current, now) && self.pending.load().is_none()
+    }
+
+    fn refresh_eligible_at(&self, current: u64, now: Instant) -> bool {
+        let deadline = current >> 2;
+        if deadline == NO_EXPIRY
+            || !matches!(
+                decode_entry_state(current),
+                EntryState::Allowed | EntryState::Denied
+            )
+        {
+            return false;
+        }
+        let now = self.tick(now);
+        now < deadline
+            && deadline - now <= self.refresh_before
+            && now >= self.refresh_not_before.load(Ordering::Relaxed)
     }
 
     fn current_at(&self, now: Instant) -> (u64, bool) {
@@ -655,19 +729,20 @@ impl<T: Subject> SubjectMap<T> {
         entry
     }
 
-    fn touch(&self, subject: &T, entry: &Entry, now: Instant) {
+    fn touch(&self, subject: &T, entry: &Entry, now: Instant) -> bool {
         let tick = self.tick(now);
         let mut entries = self.entries.lock();
-        if entries
+        let matched = entries
             .peek(subject)
-            .is_some_and(|slot| core::ptr::eq::<Entry>(slot.entry.as_ref(), entry))
-        {
+            .is_some_and(|slot| core::ptr::eq::<Entry>(slot.entry.as_ref(), entry));
+        if matched {
             let slot = entries
                 .get_mut(subject)
                 .expect("the matching entry remains present while the map is locked");
             slot.touch(tick);
         }
         self.evict(&mut entries, tick);
+        matched
     }
 
     fn update(&self, subject: &T, now: Instant, update: impl FnOnce(&Arc<Entry>)) {
@@ -864,6 +939,12 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
         Entry::admission(Arc::clone(entry))
     }
 
+    pub(crate) async fn refresh_entry(self: &Arc<Self>, subject: &T, entry: &Arc<Entry>) {
+        if self.subjects.touch(subject, entry, D::now()) {
+            self.admission_on_access(subject, entry, None).await;
+        }
+    }
+
     /// Resolves an authoritative subject verdict within the admission budget.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn admit(self: &Arc<Self>, subject: &T) -> Option<Admission<D>> {
@@ -901,6 +982,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                     Entry::pending(
                         now,
                         self.new_fetch_after(entry.clone(), subject.clone(), None, None),
+                        self.config.refresh_before_expiry(),
                     )
                 })
             });
@@ -1121,6 +1203,13 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
                         Ordering::Acquire,
                     );
                 }
+            } else {
+                let cooldown = u64::try_from(self.config.permanent_failure_cooldown().as_nanos())
+                    .unwrap_or(u64::MAX);
+                entry.refresh_not_before.store(
+                    entry.tick(D::now()).saturating_add(cooldown),
+                    Ordering::Relaxed,
+                );
             }
             entry.replace_pending(generation, None);
             return;
@@ -1182,53 +1271,48 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Gate
     ) -> Option<Admission<D>> {
         let admission = Entry::admission(Arc::clone(entry))?;
         let refresh_before = self.config.refresh_before_expiry();
-        if refresh_before.is_zero() || entry.pending.load().is_some() {
+        if refresh_before.is_zero() {
             return Some(admission);
         }
         let current = entry.current.load(Ordering::Acquire);
-        if matches!(
-            decode_entry_state(current),
-            EntryState::Allowed | EntryState::Denied
-        ) {
-            let deadline = current >> 2;
-            let access_time = D::now();
-            let now = entry.tick(access_time);
-            let refresh_before = u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX);
-            if deadline != NO_EXPIRY && now < deadline && deadline - now <= refresh_before {
-                let queue_deadline =
-                    match access_time.checked_add(self.config.refresh_enqueue_timeout()) {
-                        Some(deadline) => admission_deadline
-                            .map_or(deadline, |outer_deadline| deadline.min(outer_deadline)),
-                        None => match admission_deadline {
-                            Some(deadline) => deadline,
-                            None => return Some(admission),
-                        },
-                    };
-                let refresh = self.new_fetch_after(
-                    Arc::downgrade(entry),
-                    subject.clone(),
-                    None,
-                    Some(current),
-                );
-                if entry
-                    .pending
-                    .compare_and_swap(&None::<Arc<PendingFetch>>, Some(Arc::clone(&refresh)))
-                    .is_none()
+        let access_time = D::now();
+        if entry.refresh_due_at(current, access_time) {
+            let queue_deadline =
+                match access_time.checked_add(self.config.refresh_enqueue_timeout()) {
+                    Some(deadline) => admission_deadline
+                        .map_or(deadline, |outer_deadline| deadline.min(outer_deadline)),
+                    None => match admission_deadline {
+                        Some(deadline) => deadline,
+                        None => return Some(admission),
+                    },
+                };
+            let refresh =
+                self.new_fetch_after(Arc::downgrade(entry), subject.clone(), None, Some(current));
+            if entry
+                .pending
+                .compare_and_swap(&None::<Arc<PendingFetch>>, Some(Arc::clone(&refresh)))
+                .is_none()
+            {
+                let mut guard = PendingEnqueueGuard {
+                    entry,
+                    generation: &refresh.generation,
+                    queued: false,
+                };
+                // Another generation may have finished since the pre-check. The pending CAS
+                // acquires its cooldown store before we revalidate our own claim.
+                if entry.current.load(Ordering::Acquire) != current
+                    || !entry.refresh_eligible_at(current, D::now())
                 {
-                    let mut guard = PendingEnqueueGuard {
-                        entry,
-                        generation: &refresh.generation,
-                        queued: false,
-                    };
-                    let queued = matches!(
-                        D::timeout_at(queue_deadline, self.refresh_tx.send(refresh.future())).await,
-                        Ok(Ok(()))
-                    );
-                    if queued {
-                        guard.mark_queued();
-                    }
                     return Entry::admission(Arc::clone(entry));
                 }
+                let queued = matches!(
+                    D::timeout_at(queue_deadline, self.refresh_tx.send(refresh.future())).await,
+                    Ok(Ok(()))
+                );
+                if queued {
+                    guard.mark_queued();
+                }
+                return Entry::admission(Arc::clone(entry));
             }
         }
         Some(admission)

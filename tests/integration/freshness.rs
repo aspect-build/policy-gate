@@ -339,3 +339,488 @@ async fn unrepresentable_deadline_fails_closed() {
     assert!(admission.await.expect("admission task joins").is_err());
     runtime.stop().await;
 }
+
+fn refresh_config() -> ConfigOptions {
+    ConfigOptions {
+        refresh_before_expiry: Duration::from_millis(40),
+        permanent_failure_cooldown: Duration::from_millis(20),
+        ..freshness_config()
+    }
+}
+
+#[tokio::test]
+async fn check_reports_refresh_due_only_inside_the_window() {
+    for (config, decision) in [
+        (refresh_config(), Decision::Allowed),
+        (refresh_config(), Decision::Denied),
+        (freshness_config(), Decision::Allowed),
+        (ConfigOptions::default(), Decision::Allowed),
+    ] {
+        let source = Arc::new(ScriptedDecisionSource::default());
+        let _watch = source.push_live_watch(Vec::new()).await;
+        source
+            .push_get(SUBJECT_A, GetAction::Return(Ok(decision)))
+            .await;
+        let runtime = start_runtime(Arc::clone(&source), &config).await;
+        let subject = SUBJECT_A.parse().expect("subject UUID");
+        let admission = runtime.gate.admit(&subject).await.expect("admission");
+        let state = match decision {
+            Decision::Allowed => AdmissionState::Allowed,
+            Decision::Denied => AdmissionState::Denied,
+        };
+        assert_eq!(admission.check(), (state, false));
+        for (advance, in_window) in [(59, false), (1, true), (39, true)] {
+            runtime.time.advance(Duration::from_millis(advance)).await;
+            assert_eq!(
+                admission.check(),
+                (state, in_window && !config.refresh_before_expiry.is_zero())
+            );
+        }
+        runtime.time.advance(Duration::from_millis(1)).await;
+        let expired = config.decision_freshness_ttl != Duration::MAX;
+        assert_eq!(
+            admission.check(),
+            (
+                if expired {
+                    AdmissionState::Stale
+                } else {
+                    state
+                },
+                false
+            )
+        );
+        assert_eq!(source.get_calls(), 1, "checking never starts a lookup");
+        runtime.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn refresh_renews_the_retained_handle_in_place() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+    let admission = admit_allowed(&runtime, SUBJECT_A).await;
+    let subject = SUBJECT_A.parse().expect("subject UUID");
+    runtime.time.advance(Duration::from_millis(60)).await;
+    runtime.gate.refresh(subject, admission.clone()).await;
+    source.wait_for_get_completions(2).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    runtime.time.advance(Duration::from_millis(99)).await;
+    assert!(admission.is_allowed());
+    runtime.time.advance(Duration::from_millis(1)).await;
+    assert_eq!(admission.check(), (AdmissionState::Stale, false));
+    assert_eq!(source.get_calls(), 2);
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_is_single_flight_across_handles_and_tasks() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+    let admission = admit_allowed(&runtime, SUBJECT_A).await;
+    let second = admission.clone();
+    let release = Arc::new(Semaphore::new(0));
+    source
+        .push_get(
+            SUBJECT_A,
+            GetAction::Gate {
+                release: Arc::clone(&release),
+                result: Ok(Decision::Allowed),
+            },
+        )
+        .await;
+    runtime.time.advance(Duration::from_millis(60)).await;
+    let subject = SUBJECT_A.parse().expect("subject UUID");
+    let first_task = tokio::spawn(runtime.gate.refresh(subject, admission.clone()));
+    let second_task = tokio::spawn(runtime.gate.refresh(subject, second.clone()));
+    first_task.await.expect("first enqueue");
+    second_task.await.expect("second enqueue");
+    source.wait_for_gets(2).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    assert_eq!(second.check(), (AdmissionState::Allowed, false));
+    assert!(runtime.gate.try_cached(&subject).await.is_some());
+    assert!(runtime.gate.admit(&subject).await.is_ok());
+    assert_eq!(source.get_calls(), 2);
+    release.add_permits(1);
+    source.wait_for_get_completions(2).await;
+    runtime.time.advance(Duration::from_millis(99)).await;
+    assert!(second.is_allowed());
+    runtime.time.advance(Duration::from_millis(1)).await;
+    assert_eq!(admission.state(), AdmissionState::Stale);
+    assert_eq!(source.get_calls(), 2);
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn failed_refresh_waits_for_the_cooldown() {
+    use policy_gate::{DecisionSourceError, DecisionSourceErrorKind};
+    for kind in [
+        DecisionSourceErrorKind::Transient,
+        DecisionSourceErrorKind::Permanent,
+        DecisionSourceErrorKind::Wire,
+    ] {
+        let source = Arc::new(ScriptedDecisionSource::default());
+        let _watch = source.push_live_watch(Vec::new()).await;
+        let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+        let admission = admit_allowed(&runtime, SUBJECT_A).await;
+        source
+            .push_get(
+                SUBJECT_A,
+                GetAction::Return(Err(DecisionSourceError::new(kind, "refresh failed"))),
+            )
+            .await;
+        runtime.time.advance(Duration::from_millis(60)).await;
+        let subject = SUBJECT_A.parse().expect("subject UUID");
+        runtime.gate.refresh(subject, admission.clone()).await;
+        source.wait_for_get_completions(2).await;
+        for advance in [0, 19] {
+            runtime.time.advance(Duration::from_millis(advance)).await;
+            assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+            assert!(runtime.gate.try_cached(&subject).await.is_some());
+            assert!(runtime.gate.admit(&subject).await.is_ok());
+            runtime.gate.refresh(subject, admission.clone()).await;
+            assert_eq!(source.get_calls(), 2);
+        }
+        runtime.time.advance(Duration::from_millis(1)).await;
+        assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+        runtime.gate.refresh(subject, admission.clone()).await;
+        source.wait_for_get_completions(3).await;
+        assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+        runtime.time.advance(Duration::from_millis(99)).await;
+        assert!(admission.is_allowed());
+        runtime.time.advance(Duration::from_millis(1)).await;
+        assert_eq!(admission.state(), AdmissionState::Stale);
+        assert_eq!(source.get_calls(), 3);
+        runtime.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn zero_cooldown_retries_on_the_next_read() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let config = ConfigOptions {
+        permanent_failure_cooldown: Duration::ZERO,
+        ..refresh_config()
+    };
+    let runtime = start_runtime(Arc::clone(&source), &config).await;
+    let admission = admit_allowed(&runtime, SUBJECT_A).await;
+    source.push_get(SUBJECT_A, GetAction::Missing).await;
+    runtime.time.advance(Duration::from_millis(60)).await;
+    let subject = SUBJECT_A.parse().expect("subject UUID");
+    runtime.gate.refresh(subject, admission.clone()).await;
+    source.wait_for_get_completions(2).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+    assert!(runtime.gate.try_cached(&subject).await.is_some());
+    source.wait_for_get_completions(3).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    assert_eq!(source.get_calls(), 3);
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_with_a_mismatched_subject_is_a_no_op() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+    let admission = admit_allowed(&runtime, SUBJECT_A).await;
+    runtime.time.advance(Duration::from_millis(60)).await;
+    let wrong = SUBJECT_B.parse().expect("subject UUID");
+    runtime.gate.refresh(wrong, admission.clone()).await;
+    assert!(runtime.gate.try_cached(&wrong).await.is_none());
+    assert_eq!(source.get_calls(), 1);
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+    // A wrong subject that is itself cached must also fail the identity check.
+    drop(admit_allowed(&runtime, SUBJECT_B).await);
+    runtime.gate.refresh(wrong, admission.clone()).await;
+    assert_eq!(source.get_calls(), 2);
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_of_a_replaced_entry_is_a_no_op() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+    let old = admit_allowed(&runtime, SUBJECT_A).await;
+    runtime.time.advance(Duration::from_millis(100)).await;
+    let new = admit_allowed(&runtime, SUBJECT_A).await;
+    let subject = SUBJECT_A.parse().expect("subject UUID");
+    runtime.time.advance(Duration::from_millis(60)).await;
+    runtime.gate.refresh(subject, old.clone()).await;
+    assert_eq!(source.get_calls(), 2);
+    assert_eq!(old.check(), (AdmissionState::Stale, false));
+    assert_eq!(new.check(), (AdmissionState::Allowed, true));
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_renews_the_idle_ttl() {
+    for touch in [false, true] {
+        let source = Arc::new(ScriptedDecisionSource::default());
+        let _watch = source.push_live_watch(Vec::new()).await;
+        let config = ConfigOptions {
+            subject_ttl: Duration::from_millis(50),
+            ..refresh_config()
+        };
+        let runtime = start_runtime(Arc::clone(&source), &config).await;
+        let admission = admit_allowed(&runtime, SUBJECT_A).await;
+        runtime.time.advance(Duration::from_millis(40)).await;
+        if touch {
+            runtime
+                .gate
+                .refresh(SUBJECT_A.parse().expect("subject UUID"), admission.clone())
+                .await;
+        }
+        assert_eq!(source.get_calls(), 1, "outside the refresh window");
+        runtime.time.advance(Duration::from_millis(40)).await;
+        drop(admit_allowed(&runtime, SUBJECT_B).await);
+        assert_eq!(
+            admission.state(),
+            if touch {
+                AdmissionState::Allowed
+            } else {
+                AdmissionState::Stale
+            }
+        );
+        assert_eq!(source.get_calls(), 2);
+        runtime.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn no_events_no_refresh() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+    let admission = admit_allowed(&runtime, SUBJECT_A).await;
+    runtime.time.advance(Duration::from_millis(100)).await;
+    assert_eq!(admission.check(), (AdmissionState::Stale, false));
+    runtime
+        .gate
+        .refresh(SUBJECT_A.parse().expect("subject UUID"), admission.clone())
+        .await;
+    assert_eq!(admission.state(), AdmissionState::Stale);
+    assert_eq!(source.get_calls(), 1);
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_uses_the_retained_entry_when_the_snapshot_lags() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let config = ConfigOptions {
+        snapshot_republish_interval: Duration::from_secs(1),
+        ..refresh_config()
+    };
+    let runtime = start_runtime(Arc::clone(&source), &config).await;
+    drop(admit_allowed(&runtime, SUBJECT_A).await);
+    let admission = admit_allowed(&runtime, SUBJECT_B).await;
+    let subject = SUBJECT_B.parse().expect("subject UUID");
+    runtime.time.advance(Duration::from_millis(60)).await;
+    assert!(runtime.gate.try_cached(&subject).await.is_none());
+    runtime.gate.refresh(subject, admission.clone()).await;
+    source.wait_for_get_completions(3).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    assert_eq!(source.get_calls(), 3);
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn refresh_cannot_revive_an_expired_decision_or_overwrite_a_watch_change() {
+    for watch_change in [false, true] {
+        let source = Arc::new(ScriptedDecisionSource::default());
+        let watch = source.push_live_watch(Vec::new()).await;
+        let runtime = start_runtime(Arc::clone(&source), &refresh_config()).await;
+        let admission = admit_allowed(&runtime, SUBJECT_A).await;
+        let release = Arc::new(Semaphore::new(0));
+        source
+            .push_get(
+                SUBJECT_A,
+                GetAction::Gate {
+                    release: Arc::clone(&release),
+                    result: Ok(Decision::Allowed),
+                },
+            )
+            .await;
+        runtime.time.advance(Duration::from_millis(60)).await;
+        runtime
+            .gate
+            .refresh(SUBJECT_A.parse().expect("subject UUID"), admission.clone())
+            .await;
+        source.wait_for_gets(2).await;
+        let expected = if watch_change {
+            watch
+                .send(Ok(change(SUBJECT_A, Decision::Denied)))
+                .expect("watch live");
+            wait_for_metric(&runtime.metrics.watch_events, 1).await;
+            AdmissionState::Denied
+        } else {
+            runtime.time.advance(Duration::from_millis(40)).await;
+            AdmissionState::Stale
+        };
+        assert_eq!(admission.check(), (expected, false));
+        release.add_permits(1);
+        if watch_change {
+            tokio::task::yield_now().await;
+        } else {
+            source.wait_for_get_completions(2).await;
+        }
+        assert_eq!(admission.check(), (expected, false));
+        assert_eq!(source.get_calls(), 2);
+        runtime.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_or_timed_out_enqueue_releases_the_claim_without_cooldown() {
+    use crate::support::TestTimeDriver;
+    use policy_gate::{PolicyGate, PolicyGateConfig};
+    for timeout in [false, true] {
+        let source = Arc::new(ScriptedDecisionSource::default());
+        let _watch = source.push_live_watch(Vec::new()).await;
+        let time = TestTimeDriver::new();
+        let config = PolicyGateConfig::builder()
+            .decision_freshness_ttl(Duration::from_millis(100))
+            .refresh_before_expiry(Duration::from_millis(40))
+            .refresh_queue_capacity(1)
+            .refresh_enqueue_timeout(Duration::from_millis(10))
+            .build()
+            .expect("valid config");
+        let (gate, mut watcher, _) =
+            PolicyGate::new_with_time_driver(&config, Arc::clone(&source), time);
+        assert!(futures_util::poll!(&mut watcher).is_pending());
+        let first = SUBJECT_A.parse().expect("subject UUID");
+        let second = SUBJECT_B.parse().expect("subject UUID");
+        let first_admission = gate.admit(&first).await.expect("first admission");
+        let second_admission = gate.admit(&second).await.expect("second admission");
+        time.advance(Duration::from_millis(60)).await;
+        // Keep the watcher unpolled so the first subject fills the sole queue slot.
+        gate.refresh(first, first_admission).await;
+        let mut enqueue = Box::pin(gate.refresh(second, second_admission.clone()));
+        assert!(futures_util::poll!(&mut enqueue).is_pending());
+        assert_eq!(second_admission.check(), (AdmissionState::Allowed, false));
+        if timeout {
+            time.advance(Duration::from_millis(10)).await;
+            assert!(futures_util::poll!(&mut enqueue).is_ready());
+        }
+        drop(enqueue);
+        assert_eq!(second_admission.check(), (AdmissionState::Allowed, true));
+        assert_eq!(source.get_calls(), 2, "enqueue never calls the authority");
+        assert!(futures_util::poll!(&mut watcher).is_pending());
+        gate.refresh(second, second_admission.clone()).await;
+        assert!(futures_util::poll!(&mut watcher).is_pending());
+        assert_eq!(source.get_calls(), 4);
+        assert_eq!(second_admission.check(), (AdmissionState::Allowed, false));
+    }
+}
+
+#[tokio::test]
+async fn delayed_refresh_claimant_observes_a_completed_generations_cooldown() {
+    use core::cell::Cell;
+    use core::sync::atomic::AtomicUsize;
+    use std::sync::{Barrier, OnceLock};
+    use std::time::Instant;
+
+    use futures_util::FutureExt as _;
+    use policy_gate::{
+        DecisionSource, DecisionSourceError, DecisionSourceErrorKind, PolicyGate, PolicyGateConfig,
+        TimeDriver,
+    };
+
+    std::thread_local! { static PAUSE_CLONE: Cell<bool> = const { Cell::new(false) }; }
+    static ENTER: Barrier = Barrier::new(2);
+    static RELEASE: Barrier = Barrier::new(2);
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static MILLIS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Eq, PartialEq, Hash)]
+    struct Key;
+    impl Clone for Key {
+        fn clone(&self) -> Self {
+            if PAUSE_CLONE.with(|pause| pause.replace(false)) {
+                ENTER.wait();
+                RELEASE.wait();
+            }
+            Self
+        }
+    }
+    #[derive(Clone)]
+    struct Clock;
+    impl TimeDriver for Clock {
+        fn now() -> Instant {
+            *EPOCH.get_or_init(Instant::now)
+                + Duration::from_millis(MILLIS.load(Ordering::SeqCst) as u64)
+        }
+        fn sleep_until(_: Instant) -> impl Future<Output = ()> + Send {
+            core::future::pending()
+        }
+        fn yield_now() -> impl Future<Output = ()> + Send {
+            core::future::ready(())
+        }
+    }
+    struct Source(AtomicUsize);
+    impl DecisionSource<Key> for Source {
+        type Changes = futures_util::stream::Pending<
+            Result<policy_gate::DecisionChange<Key>, DecisionSourceError>,
+        >;
+        fn watch_subject_decisions(
+            &self,
+        ) -> impl Future<Output = Result<Self::Changes, DecisionSourceError>> + Send {
+            core::future::ready(Ok(futures_util::stream::pending()))
+        }
+        fn get_subject_decision(
+            &self,
+            _: &Key,
+        ) -> impl Future<Output = Result<Option<Decision>, DecisionSourceError>> + Send {
+            core::future::ready(if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Some(Decision::Allowed))
+            } else {
+                Err(DecisionSourceError::new(
+                    DecisionSourceErrorKind::Transient,
+                    "refresh failed",
+                ))
+            })
+        }
+    }
+
+    let config = PolicyGateConfig::builder()
+        .decision_freshness_ttl(Duration::from_millis(100))
+        .refresh_before_expiry(Duration::from_millis(40))
+        .permanent_failure_cooldown(Duration::from_millis(20))
+        .build()
+        .expect("valid config");
+    let source = Arc::new(Source(AtomicUsize::new(0)));
+    let (gate, mut watcher, _) =
+        PolicyGate::new_with_time_driver(&config, Arc::clone(&source), Clock);
+    assert!(futures_util::poll!(&mut watcher).is_pending());
+    let admission = gate.admit(&Key).await.expect("admission");
+    MILLIS.store(60, Ordering::SeqCst);
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+    let contender_gate = gate.clone();
+    let contender_admission = admission.clone();
+    let contender = std::thread::spawn(move || {
+        PAUSE_CLONE.with(|pause| pause.set(true));
+        contender_gate
+            .refresh(Key, contender_admission)
+            .now_or_never()
+            .expect("queue has room");
+    });
+    // Pause after the due pre-check but before the pending CAS, then complete another generation.
+    ENTER.wait();
+    gate.refresh(Key, admission.clone()).await;
+    assert!(futures_util::poll!(&mut watcher).is_pending());
+    RELEASE.wait();
+    contender.join().expect("contender finishes");
+    assert!(futures_util::poll!(&mut watcher).is_pending());
+    assert_eq!(
+        source.0.load(Ordering::SeqCst),
+        2,
+        "delayed claim must respect cooldown"
+    );
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    MILLIS.store(80, Ordering::SeqCst);
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+}
