@@ -161,6 +161,7 @@
 
 use core::fmt;
 use core::time::Duration;
+use std::sync::Arc;
 use std::time::Instant;
 
 mod gate;
@@ -202,8 +203,8 @@ pub use tonic_source::{
 pub use watcher::{DecisionSourceHealth, DecisionSourceHealthStatus, DecisionWatcher};
 
 /// Gate, watcher, and health handle created for one decision source.
-pub type PolicyGateParts<T, C, M = NoopPolicyGateMetrics, D = TokioTimeDriver> = (
-    PolicyGate<T, C, M, D>,
+pub type PolicyGateParts<T, C, M = NoopPolicyGateMetrics, D = TokioTimeDriver, P = ()> = (
+    PolicyGate<T, C, M, D, P>,
     DecisionWatcher,
     std::sync::Arc<DecisionSourceHealth<D>>,
 );
@@ -248,6 +249,12 @@ pub enum Decision {
     Allowed,
     /// The subject may not start work, and admitted work must stop.
     Denied,
+}
+
+/// Decision and optional application data returned by a unary lookup.
+pub struct DecisionResult<P = ()> {
+    pub decision: Decision,
+    pub payload: Option<Arc<P>>,
 }
 
 /// One normalized authoritative subject-state update.

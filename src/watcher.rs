@@ -99,8 +99,8 @@ impl core::fmt::Debug for DecisionWatcher {
 
 impl DecisionWatcher {
     /// Constructs the watcher and its shared health indicator.
-    pub(crate) fn new<T, C, M, D>(
-        state: Arc<GateState<T, C, M, D>>,
+    pub(crate) fn new<T, C, M, D, P>(
+        state: Arc<GateState<T, C, M, D, P>>,
         client: Arc<C>,
         metrics: M,
         connected: Sender<bool>,
@@ -109,9 +109,10 @@ impl DecisionWatcher {
     ) -> (Self, Arc<DecisionSourceHealth<D>>)
     where
         T: Subject,
-        C: DecisionSource<T>,
+        C: DecisionSource<T, P>,
         M: PolicyGateMetrics,
         D: TimeDriver,
+        P: Send + Sync + 'static,
     {
         let health = Arc::new(DecisionSourceHealth {
             disconnected_since: state.disconnected_since(),
@@ -133,21 +134,38 @@ impl Future for DecisionWatcher {
     }
 }
 
-struct WatchLease<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> {
-    state: Arc<GateState<T, C, M, D>>,
+struct WatchLease<
+    T: Subject,
+    C: DecisionSource<T, P>,
+    M: PolicyGateMetrics,
+    D: TimeDriver,
+    P: Send + Sync + 'static,
+> {
+    state: Arc<GateState<T, C, M, D, P>>,
     connected: Sender<bool>,
 }
 
-impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> Drop
-    for WatchLease<T, C, M, D>
+impl<
+    T: Subject,
+    C: DecisionSource<T, P>,
+    M: PolicyGateMetrics,
+    D: TimeDriver,
+    P: Send + Sync + 'static,
+> Drop for WatchLease<T, C, M, D, P>
 {
     fn drop(&mut self) {
         self.state.watch_disconnected(&self.connected);
     }
 }
 
-async fn watch_source<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver>(
-    lease: WatchLease<T, C, M, D>,
+async fn watch_source<
+    T: Subject,
+    C: DecisionSource<T, P>,
+    M: PolicyGateMetrics,
+    D: TimeDriver,
+    P: Send + Sync + 'static,
+>(
+    lease: WatchLease<T, C, M, D, P>,
     client: Arc<C>,
     metrics: M,
     mut refresh_rx: Receiver<PendingFuture>,
