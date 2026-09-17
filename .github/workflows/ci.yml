@@ -26,5 +26,6 @@ jobs:
           cargo check --no-default-features --features tower-layer
           cargo check --no-default-features --features axum-body
           cargo check --no-default-features --features tonic-client
+          cargo check --no-default-features --features tonic-server
           cargo check --no-default-features --features tonic-layer
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
