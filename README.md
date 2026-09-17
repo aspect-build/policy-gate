@@ -31,11 +31,20 @@ if admission.is_allowed() {
 | `tokio` | Default `TimeDriver` implementation and convenience constructors |
 | `tower-layer` | Transport-neutral Tower middleware and streaming body enforcement |
 | `axum-body` | `AxumBodyAdapter` for type-erased Axum bodies |
-| `tonic-client` | Scope-bound tonic decision source and private protobuf bindings |
+| `tonic-client` | Scope-bound tonic decision source and public client bindings |
+| `tonic-server` | Public policy-authority server bindings |
 | `tonic-layer` | gRPC rejection and stream-termination rendering |
 
 The default feature set enables Tokio scheduling and the tonic decision source. Enable only the
 runtime and transport adapters a service uses; use `default-features = false` for the core gate.
+
+The canonical policy-authority schema is
+[`proto/aspect/policy/gate/v1/policy_authority.proto`](proto/aspect/policy/gate/v1/policy_authority.proto).
+Its checked-in Rust bindings are public as `policy_gate::policy_proto`. Regenerate them with:
+
+```shell
+UPDATE_POLICY_PROTO=1 cargo test --all-features --test integration canonical_policy_proto_matches_generated_rust
+```
 
 ## HTTP middleware example
 
