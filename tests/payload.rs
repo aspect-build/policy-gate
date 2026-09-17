@@ -1,5 +1,6 @@
 // Copyright 2026 Aspect Build Systems, Inc. All rights reserved.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ type Gate = PolicyGate<u8, Source, NoopPolicyGateMetrics, TestTimeDriver, Payloa
 #[derive(Default)]
 struct Source {
     replies: Mutex<VecDeque<oneshot::Receiver<Reply>>>,
+    calls: AtomicUsize,
     watch: Mutex<Option<mpsc::UnboundedReceiver<Change>>>,
 }
 
@@ -49,6 +51,7 @@ impl DecisionSource<u8, Payload> for Source {
     }
 
     async fn get_subject_decision_result(&self, _: &u8) -> Reply {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let reply = self.replies.lock().pop_front().expect("scripted reply");
         reply.await.expect("reply sender")
     }
@@ -66,6 +69,7 @@ fn allowed(value: &'static str) -> DecisionResult<Payload> {
     DecisionResult {
         decision: Decision::Allowed,
         payload: Some(Arc::new(Payload(value))),
+        valid_until: None,
     }
 }
 
@@ -196,5 +200,186 @@ async fn expiry_latch_fences_late_refresh_payload() {
     RELEASE.wait();
     let _watcher = completion.join().unwrap();
     assert_eq!(admission.state(), AdmissionState::Stale);
+    assert!(admission.payload().is_none());
+}
+
+fn capped(value: &'static str, deadline: Instant) -> DecisionResult<Payload> {
+    DecisionResult {
+        valid_until: Some(deadline),
+        ..allowed(value)
+    }
+}
+
+#[tokio::test]
+async fn validity_caps_freshness_and_reusing_a_result_keeps_its_anchor() {
+    let (_watch, rx) = mpsc::unbounded_channel();
+    let source = Arc::new(Source {
+        watch: Mutex::new(Some(rx)),
+        ..Source::default()
+    });
+    let time = TestTimeDriver::new();
+    let (gate, mut watcher, _) = Gate::new_with_time_driver(
+        &PolicyGateConfig::builder()
+            .decision_freshness_ttl(Duration::from_millis(100))
+            .refresh_before_expiry(Duration::from_millis(40))
+            .build()
+            .unwrap(),
+        Arc::clone(&source),
+        time,
+    );
+    assert!(poll!(&mut watcher).is_pending());
+    let anchor = time.now() + Duration::from_millis(30);
+    assert!(
+        source
+            .enqueue()
+            .send(Ok(Some(capped("short", anchor))))
+            .is_ok()
+    );
+    let short = gate.admit(&1).await.unwrap();
+    assert_eq!(short.check(), (AdmissionState::Allowed, false));
+    // A later source deadline must never extend the configured 100 ms TTL.
+    assert!(
+        source
+            .enqueue()
+            .send(Ok(Some(capped(
+                "long",
+                time.now() + Duration::from_secs(1)
+            ))))
+            .is_ok()
+    );
+    let long = gate.admit(&2).await.unwrap();
+    time.advance(Duration::from_millis(15)).await;
+    assert_eq!(short.check(), (AdmissionState::Allowed, true));
+    assert!(
+        source
+            .enqueue()
+            .send(Ok(Some(capped("reused", anchor))))
+            .is_ok()
+    );
+    gate.refresh(1, short.clone()).await;
+    assert!(poll!(&mut watcher).is_pending());
+    assert_eq!(short.payload().unwrap().0, "reused");
+    assert_eq!(short.check(), (AdmissionState::Allowed, false));
+    time.advance(Duration::from_millis(15)).await;
+    assert_eq!(short.state(), AdmissionState::Stale);
+    assert!(short.payload().is_none());
+    time.advance(Duration::from_millis(70)).await;
+    assert_eq!(long.state(), AdmissionState::Stale);
+    assert!(long.payload().is_none());
+}
+
+#[tokio::test]
+async fn expired_cold_results_back_off_before_retrying() {
+    let (_watch, rx) = mpsc::unbounded_channel();
+    let source = Arc::new(Source {
+        watch: Mutex::new(Some(rx)),
+        ..Source::default()
+    });
+    let time = TestTimeDriver::new();
+    let (gate, mut watcher, _) = Gate::new_with_time_driver(
+        &PolicyGateConfig::builder()
+            .initial_admission_retry_delay(Duration::from_millis(10))
+            .max_admission_retry_delay(Duration::from_millis(20))
+            .build()
+            .unwrap(),
+        Arc::clone(&source),
+        time,
+    );
+    assert!(poll!(&mut watcher).is_pending());
+    for _ in 0..2 {
+        assert!(
+            source
+                .enqueue()
+                .send(Ok(Some(capped("expired", time.now()))))
+                .is_ok()
+        );
+    }
+    assert!(source.enqueue().send(Ok(Some(allowed("fresh")))).is_ok());
+    let mut admit = Box::pin(gate.admit(&1));
+    assert!(poll!(&mut admit).is_pending());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    time.advance(Duration::from_millis(9)).await;
+    assert!(poll!(&mut admit).is_pending());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    time.advance(Duration::from_millis(1)).await;
+    assert!(poll!(&mut admit).is_pending());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    time.advance(Duration::from_millis(19)).await;
+    assert!(poll!(&mut admit).is_pending());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    time.advance(Duration::from_millis(1)).await;
+    assert_eq!(admit.await.unwrap().payload().unwrap().0, "fresh");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn expired_refresh_retains_snapshot_and_short_success_waits_half_its_lifetime() {
+    let (_watch, rx) = mpsc::unbounded_channel();
+    let source = Arc::new(Source {
+        watch: Mutex::new(Some(rx)),
+        ..Source::default()
+    });
+    let time = TestTimeDriver::new();
+    let (gate, mut watcher, _) = Gate::new_with_time_driver(
+        &PolicyGateConfig::builder()
+            .decision_freshness_ttl(Duration::from_millis(100))
+            .refresh_before_expiry(Duration::from_millis(40))
+            .permanent_failure_cooldown(Duration::from_millis(10))
+            .build()
+            .unwrap(),
+        Arc::clone(&source),
+        time,
+    );
+    assert!(poll!(&mut watcher).is_pending());
+    assert!(source.enqueue().send(Ok(Some(allowed("old")))).is_ok());
+    let admission = gate.admit(&1).await.unwrap();
+    time.advance(Duration::from_millis(60)).await;
+    // A denial that expires while the lookup is pending cannot replace the old allow/payload.
+    let reply = source.enqueue();
+    let deadline = time.now() + Duration::from_millis(5);
+    gate.refresh(1, admission.clone()).await;
+    assert!(poll!(&mut watcher).is_pending());
+    time.advance(Duration::from_millis(5)).await;
+    assert!(
+        reply
+            .send(Ok(Some(DecisionResult {
+                decision: Decision::Denied,
+                ..capped("expired", deadline)
+            })))
+            .is_ok()
+    );
+    assert!(poll!(&mut watcher).is_pending());
+    assert_eq!(admission.payload().unwrap().0, "old");
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    time.advance(Duration::from_millis(9)).await;
+    gate.refresh(1, admission.clone()).await;
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    time.advance(Duration::from_millis(1)).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+    assert!(
+        source
+            .enqueue()
+            .send(Ok(Some(capped(
+                "short",
+                time.now() + Duration::from_millis(20)
+            ))))
+            .is_ok()
+    );
+    gate.refresh(1, admission.clone()).await;
+    assert!(poll!(&mut watcher).is_pending());
+    assert_eq!(admission.payload().unwrap().0, "short");
+    for _ in 0..4 {
+        assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+        gate.refresh(1, admission.clone()).await;
+        assert!(gate.try_cached(&1).await.is_some());
+        assert!(poll!(&mut watcher).is_pending());
+    }
+    assert_eq!(source.calls.load(Ordering::SeqCst), 3);
+    time.advance(Duration::from_millis(9)).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+    time.advance(Duration::from_millis(1)).await;
+    assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+    time.advance(Duration::from_millis(10)).await;
+    assert_eq!(admission.check(), (AdmissionState::Stale, false));
     assert!(admission.payload().is_none());
 }

@@ -80,7 +80,7 @@ let config = PolicyGateConfig::builder()
 Admission handles carry the gate's concrete time driver as `Admission<D>` (defaulting to
 `TokioTimeDriver`). Clock calls are statically dispatched; entries store no driver or clock callback.
 
-The freshness deadline starts when a lookup completes, a proactive refresh completes, or an
+The configured freshness deadline starts when a lookup completes, a proactive refresh completes, or an
 authoritative watch change arrives;
 ordinary cache access does not extend it. `Admission::is_allowed()` returns false for denied,
 stale, or expired decisions; `state()` reports expiration as `Stale`. Admission refetches an expired
@@ -97,6 +97,16 @@ absolute deadline; watch disconnects and eviction retain their existing stale/re
 behavior. The default `DEFAULT_DECISION_FRESHNESS_TTL` is exactly `Duration::MAX`, a never-expire
 sentinel that is not converted into an `Instant`. Freshness and background refresh are disabled by
 default, so existing users retain the original request and unary-call behavior.
+
+A source may override `DecisionSource::get_subject_decision_result` and return
+`DecisionResult<P> { decision, payload, valid_until }`. `valid_until: None` preserves configured
+freshness. `Some(deadline)` caps both decision and payload validity, even when configured freshness
+is disabled. Use the gate's `TimeDriver` clock domain and retain the original `Instant` when reusing
+a result; each lookup must not restart its lifetime. An already-expired result uses admission retry
+backoff or, during refresh, preserves the prior unexpired snapshot and starts failure cooldown.
+A successful capped result waits at least half its remaining effective lifetime before becoming
+refresh-eligible, in addition to the configured refresh window. Existing sources implementing only
+the binary lookup continue to use the default adapter without changes.
 
 For a retained admission on a long-lived outbound Tonic stream, use `check()` on each event and
 let the caller spawn `refresh()`. The existing handle observes a successful renewal in place.

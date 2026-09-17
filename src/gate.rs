@@ -65,6 +65,10 @@ pub trait DecisionSource<T: Subject, P = ()>: Send + Sync + 'static {
         subject: &T,
     ) -> impl Future<Output = Result<Option<Decision>, DecisionSourceError>> + Send;
 
+    /// Fetches a decision with optional payload and an anchored validity cap.
+    ///
+    /// The default adapter supplies neither payload nor cap, preserving configured freshness.
+    /// An already-expired result is handled as a transient lookup failure.
     fn get_subject_decision_result(
         &self,
         subject: &T,
@@ -74,6 +78,7 @@ pub trait DecisionSource<T: Subject, P = ()>: Send + Sync + 'static {
                 result.map(|decision| DecisionResult {
                     decision,
                     payload: None,
+                    valid_until: None,
                 })
             })
         }
@@ -178,7 +183,7 @@ impl<D: TimeDriver, P> Admission<D, P> {
                 unreachable!("an admission is created only from an authoritative state")
             }
         };
-        (state, self.entry.refresh_due_at(current.0, now))
+        (state, self.entry.refresh_due_at(&current, now))
     }
 
     /// Returns whether the current decision is allowed, authoritative, and unexpired.
@@ -491,7 +496,8 @@ pub(crate) struct Entry<P> {
     refresh_not_before: AtomicU64,
 }
 
-struct EntrySnapshot<P>(u64, Option<Arc<P>>);
+// Encoded state/deadline, payload, and earliest refresh tick publish together.
+struct EntrySnapshot<P>(u64, Option<Arc<P>>, u64);
 
 const _: () = assert!(core::mem::size_of::<Entry<()>>() == 128);
 #[cfg(target_pointer_width = "64")]
@@ -515,6 +521,7 @@ impl<P> Entry<P> {
             current: ArcSwap::from_pointee(EntrySnapshot(
                 Self::word(EntryState::Pending, NO_EXPIRY),
                 None,
+                0,
             )),
             epoch,
             pending: ArcSwapOption::from(Some(fetch)),
@@ -562,9 +569,7 @@ impl<P> Entry<P> {
     fn compare_exchange(
         &self,
         current: EntryState,
-        new: EntryState,
-        deadline: u64,
-        payload: Option<&Arc<P>>,
+        next: &Arc<EntrySnapshot<P>>,
     ) -> Result<(), EntryState> {
         let mut previous = self.current.load_full();
         loop {
@@ -572,10 +577,7 @@ impl<P> Entry<P> {
             if previous_state != current {
                 return Err(previous_state);
             }
-            let changed = self.current.compare_and_swap(
-                &previous,
-                Arc::new(EntrySnapshot(Self::word(new, deadline), payload.cloned())),
-            );
+            let changed = self.current.compare_and_swap(&previous, Arc::clone(next));
             if Arc::ptr_eq(&changed, &previous) {
                 return Ok(());
             }
@@ -612,15 +614,15 @@ impl<P> Entry<P> {
         deadline != NO_EXPIRY && self.tick(now) >= deadline
     }
 
-    fn refresh_due_at(&self, current: u64, now: Instant) -> bool {
+    fn refresh_due_at(&self, current: &EntrySnapshot<P>, now: Instant) -> bool {
         self.refresh_eligible_at(current, now) && self.pending.load().is_none()
     }
 
-    fn refresh_eligible_at(&self, current: u64, now: Instant) -> bool {
-        let deadline = current >> 2;
+    fn refresh_eligible_at(&self, current: &EntrySnapshot<P>, now: Instant) -> bool {
+        let deadline = current.0 >> 2;
         if deadline == NO_EXPIRY
             || !matches!(
-                decode_entry_state(current),
+                decode_entry_state(current.0),
                 EntryState::Allowed | EntryState::Denied
             )
         {
@@ -628,6 +630,7 @@ impl<P> Entry<P> {
         }
         let now = self.tick(now);
         now < deadline
+            && now >= current.2
             && deadline - now <= self.refresh_before
             && now >= self.refresh_not_before.load(Ordering::Relaxed)
     }
@@ -643,7 +646,7 @@ impl<P> Entry<P> {
             if current.0 == stale {
                 return (current, true);
             }
-            let next = Arc::new(EntrySnapshot(stale, None));
+            let next = Arc::new(EntrySnapshot(stale, None, 0));
             let changed = self.current.compare_and_swap(&current, Arc::clone(&next));
             if Arc::ptr_eq(&changed, &current) {
                 return (next, true);
@@ -704,6 +707,7 @@ impl<P> Entry<P> {
                 Arc::new(EntrySnapshot(
                     (previous.0 & !STATE_MASK) | EntryState::Stale as u64,
                     None,
+                    0,
                 )),
             );
             if Arc::ptr_eq(&changed, &previous) {
@@ -973,8 +977,30 @@ impl<
         Arc::clone(&self.disconnected_since)
     }
 
-    fn decision_deadline(&self, entry: &Entry<P>) -> u64 {
-        entry.deadline_after(D::now(), self.config.decision_freshness_ttl())
+    fn decision_snapshot(
+        &self,
+        entry: &Entry<P>,
+        result: &DecisionResult<P>,
+    ) -> Arc<EntrySnapshot<P>> {
+        let now = D::now();
+        let configured = entry.deadline_after(now, self.config.decision_freshness_ttl());
+        let deadline = result
+            .valid_until
+            .map_or(configured, |cap| configured.min(entry.tick(cap)));
+        // A cap inside the refresh window must not cause immediate successful refreshes.
+        let refresh_after = result.valid_until.map_or(0, |_| {
+            let now = entry.tick(now);
+            now + deadline.saturating_sub(now).div_ceil(2)
+        });
+        Arc::new(EntrySnapshot(
+            Entry::<P>::word(result.decision.into(), deadline),
+            result
+                .payload
+                .as_ref()
+                .filter(|_| result.decision == Decision::Allowed)
+                .cloned(),
+            refresh_after,
+        ))
     }
 
     /// Reads subject state through the snapshot and records its map recency.
@@ -1196,12 +1222,22 @@ impl<
                                     "subject state lookup timed out",
                                 )
                             })??;
-                    result.ok_or_else(|| {
+                    let result = result.ok_or_else(|| {
                         DecisionSourceError::new(
                             DecisionSourceErrorKind::Transient,
                             "decision source holds no decision for the subject",
                         )
-                    })
+                    })?;
+                    if result
+                        .valid_until
+                        .is_some_and(|deadline| deadline <= D::now())
+                    {
+                        return Err(DecisionSourceError::new(
+                            DecisionSourceErrorKind::Transient,
+                            "decision source returned an expired decision",
+                        ));
+                    }
+                    Ok(result)
                 })
                 .catch_unwind()
                 .await
@@ -1256,15 +1292,9 @@ impl<
         if let Some(current) = refresh_from {
             if let Ok(result) = result {
                 if !entry.is_expired_at(current.0, D::now()) {
-                    entry.current.compare_and_swap(
-                        current,
-                        Arc::new(EntrySnapshot(
-                            Entry::<P>::word(result.decision.into(), self.decision_deadline(entry)),
-                            (result.decision == Decision::Allowed)
-                                .then(|| result.payload.clone())
-                                .flatten(),
-                        )),
-                    );
+                    entry
+                        .current
+                        .compare_and_swap(current, self.decision_snapshot(entry, result));
                 }
             } else {
                 let cooldown = u64::try_from(self.config.permanent_failure_cooldown().as_nanos())
@@ -1280,15 +1310,7 @@ impl<
         if let Ok(result) = result {
             // A watch event that wins this CAS supplies the verdict that stands.
             if entry
-                .compare_exchange(
-                    EntryState::Pending,
-                    result.decision.into(),
-                    self.decision_deadline(entry),
-                    result
-                        .payload
-                        .as_ref()
-                        .filter(|_| result.decision == Decision::Allowed),
-                )
+                .compare_exchange(EntryState::Pending, &self.decision_snapshot(entry, result))
                 .is_ok()
             {
                 entry.replace_pending(generation, None);
@@ -1316,7 +1338,14 @@ impl<
                 return false;
             }
             entry
-                .compare_exchange(EntryState::Pending, EntryState::Stale, NO_EXPIRY, None)
+                .compare_exchange(
+                    EntryState::Pending,
+                    &Arc::new(EntrySnapshot(
+                        Entry::<P>::word(EntryState::Stale, NO_EXPIRY),
+                        None,
+                        0,
+                    )),
+                )
                 .is_ok()
         });
         if removed {
@@ -1343,7 +1372,7 @@ impl<
         }
         let current = entry.current.load_full();
         let access_time = D::now();
-        if entry.refresh_due_at(current.0, access_time) {
+        if entry.refresh_due_at(&current, access_time) {
             let queue_deadline =
                 match access_time.checked_add(self.config.refresh_enqueue_timeout()) {
                     Some(deadline) => admission_deadline
@@ -1372,7 +1401,7 @@ impl<
                 // Another generation may have finished since the pre-check. The pending CAS
                 // acquires its cooldown store before we revalidate our own claim.
                 if !Arc::ptr_eq(&entry.current.load_full(), &current)
-                    || !entry.refresh_eligible_at(current.0, D::now())
+                    || !entry.refresh_eligible_at(&current, D::now())
                 {
                     return Entry::admission(Arc::clone(entry));
                 }
@@ -1423,7 +1452,6 @@ impl<
         // Absent subjects are ignored: a vanished entry is re-admitted by its stream or next request.
         if let Some(decision) = change.decision {
             self.subjects.update(subject, D::now(), |entry| {
-                let next = decision.into();
                 loop {
                     match decode_entry_state(entry.current.load().0) {
                         current @ (EntryState::Pending
@@ -1431,9 +1459,14 @@ impl<
                         | EntryState::Denied
                         | EntryState::Stale) => match entry.compare_exchange(
                             current,
-                            next,
-                            self.decision_deadline(entry),
-                            None,
+                            &self.decision_snapshot(
+                                entry,
+                                &DecisionResult {
+                                    decision,
+                                    payload: None,
+                                    valid_until: None,
+                                },
+                            ),
                         ) {
                             Ok(()) => {
                                 entry.abort_pending();
