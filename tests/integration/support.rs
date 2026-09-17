@@ -122,68 +122,68 @@ impl core::ops::Deref for TestMetrics {
 }
 
 impl PolicyGateMetrics for TestMetrics {
-    fn denial(self) {
+    fn denial(&self) {
         self.denials.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn unavailable_rejection(self) {
+    fn unavailable_rejection(&self) {
         self.unavailable_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot_miss(self) {
+    fn snapshot_miss(&self) {
         self.snapshot_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn map_hit(self) {
+    fn map_hit(&self) {
         self.map_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn stream_cutoff(self) {
+    fn stream_cutoff(&self) {
         self.stream_cutoffs.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot_republish(self) {
+    fn snapshot_republish(&self) {
         self.snapshot_republishes.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn unary_call(self) {
+    fn unary_call(&self) {
         self.unary_calls.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn unary_failure(self) {
+    fn unary_failure(&self) {
         self.unary_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn admission_retry(self) {
+    fn admission_retry(&self) {
         self.admission_retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn admission_timeout(self) {
+    fn admission_timeout(&self) {
         self.admission_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn set_watch_connected(self, connected: bool) {
+    fn set_watch_connected(&self, connected: bool) {
         self.watch_connected
             .store(u64::from(connected), Ordering::Release);
     }
 
-    fn watch_disconnect(self) {
+    fn watch_disconnect(&self) {
         self.watch_disconnects.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn watch_open_failure(self) {
+    fn watch_open_failure(&self) {
         self.watch_open_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn watch_event(self) {
+    fn watch_event(&self) {
         self.watch_events.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn wire_failure(self) {
+    fn wire_failure(&self) {
         self.wire_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn missing_subject_rejection(self) {
+    fn missing_subject_rejection(&self) {
         self.missing_subject_rejections
             .fetch_add(1, Ordering::Relaxed);
     }

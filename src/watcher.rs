@@ -110,7 +110,7 @@ impl DecisionWatcher {
     where
         T: Subject,
         C: DecisionSource<T, P>,
-        M: PolicyGateMetrics,
+        M: PolicyGateMetrics + Clone,
         D: TimeDriver,
         P: Send + Sync + 'static,
     {
@@ -137,7 +137,7 @@ impl Future for DecisionWatcher {
 struct WatchLease<
     T: Subject,
     C: DecisionSource<T, P>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     D: TimeDriver,
     P: Send + Sync + 'static,
 > {
@@ -148,7 +148,7 @@ struct WatchLease<
 impl<
     T: Subject,
     C: DecisionSource<T, P>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     D: TimeDriver,
     P: Send + Sync + 'static,
 > Drop for WatchLease<T, C, M, D, P>
@@ -161,7 +161,7 @@ impl<
 async fn watch_source<
     T: Subject,
     C: DecisionSource<T, P>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     D: TimeDriver,
     P: Send + Sync + 'static,
 >(

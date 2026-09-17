@@ -285,14 +285,14 @@ impl core::fmt::Display for LimitExceededError {
 impl core::error::Error for LimitExceededError {}
 
 /// Shared gate, rejection text, and metrics retained by request/response wrappers.
-pub(crate) struct GateContext<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D> {
+pub(crate) struct GateContext<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics + Clone, D> {
     pub(crate) gate: PolicyGate<T, C, M, D>,
     pub(crate) rejection_message: Arc<str>,
     missing_subject_message: Arc<str>,
     pub(crate) metrics: M,
 }
 
-impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics, D: TimeDriver> core::fmt::Debug
+impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics + Clone, D: TimeDriver> core::fmt::Debug
     for GateContext<T, C, M, D>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -326,7 +326,7 @@ pub struct PolicyGateLayer<
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
 {
     context: Arc<GateContext<T, C, M, D>>,
@@ -341,7 +341,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
 {
     fn clone(&self) -> Self {
@@ -360,7 +360,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -374,7 +374,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     D: TimeDriver,
 {
     /// Constructs a layer over the transport-neutral gate with plain HTTP rejection rendering.
@@ -398,7 +398,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
 {
@@ -459,7 +459,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
 {
@@ -497,7 +497,7 @@ pub struct PolicyGateMiddleware<
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
 {
     inner: S,
@@ -514,7 +514,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
 {
@@ -535,7 +535,7 @@ where
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
 {
@@ -558,7 +558,7 @@ where
     T: Subject,
     C: DecisionSource<T> + 'static,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
     S: tower::Service<Request<A::Body>, Response = Response<ResBody>, Error = Infallible>
@@ -688,7 +688,7 @@ pub struct EnforcedResponseFuture<
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D,
 > {
@@ -707,7 +707,7 @@ impl<
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
 > core::fmt::Debug for EnforcedResponseFuture<F, T, C, A, M, R, D>
@@ -723,7 +723,7 @@ where
     T: Subject,
     C: DecisionSource<T> + 'static,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
     F: Future<Output = Result<Response<ResBody>, Infallible>>,
@@ -775,7 +775,7 @@ where
     T: Subject,
     C: DecisionSource<T> + 'static,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
     S: tower::Service<Request<A::Body>, Response = Response<ResBody>>,
@@ -832,7 +832,7 @@ fn deny<
     T: Subject,
     C: DecisionSource<T>,
     A: BodyAdapter,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: RejectionResponse<A>,
     D: TimeDriver,
 >(
