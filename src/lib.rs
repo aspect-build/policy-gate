@@ -178,6 +178,7 @@ mod stream;
 mod time;
 #[cfg(feature = "tonic-client")]
 mod tonic_source;
+mod transform;
 mod watcher;
 
 pub use gate::{
@@ -200,6 +201,7 @@ pub use tonic_source::{
     ScopeEchoPolicy, TonicDecisionSource, TonicDecisionSourceConfig,
     TonicDecisionSourceConfigError, TonicDecisionStream,
 };
+pub use transform::{DecisionTransform, TransformSource};
 pub use watcher::{DecisionSourceHealth, DecisionSourceHealthStatus, DecisionWatcher};
 
 /// Gate, watcher, and health handle created for one decision source.
