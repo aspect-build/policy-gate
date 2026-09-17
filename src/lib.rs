@@ -157,6 +157,7 @@
 //! | `tower-layer` | `PolicyGateLayer` and streaming body enforcement |
 //! | `axum-body` | `AxumBodyAdapter`, for type-erased Axum bodies; implies `tower-layer` |
 //! | `tonic-client` | `TonicDecisionSource` over the bundled policy-authority protocol (default) |
+//! | `tonic-server` | Public policy-authority server bindings |
 //! | `tonic-layer` | `TonicRejectionResponse`, for gRPC status rendering; implies `tower-layer` |
 
 use core::fmt;
@@ -170,9 +171,10 @@ mod grpc;
 #[cfg(feature = "tower-layer")]
 mod layer;
 mod metrics;
-#[cfg(feature = "tonic-client")]
+#[cfg(any(feature = "tonic-client", feature = "tonic-server"))]
 #[allow(unknown_lints, unused_qualifications, clippy::all, clippy::pedantic)]
-mod policy_proto;
+#[rustfmt::skip]
+pub mod policy_proto;
 #[cfg(feature = "tower-layer")]
 mod stream;
 mod time;
