@@ -234,7 +234,7 @@ impl core::error::Error for AdmissionUnavailable {}
 pub struct PolicyGate<
     T: Subject,
     C: DecisionSource<T, P>,
-    M: PolicyGateMetrics = NoopPolicyGateMetrics,
+    M: PolicyGateMetrics + Clone = NoopPolicyGateMetrics,
     D = TokioTimeDriver,
     P = (),
 > {
@@ -242,19 +242,19 @@ pub struct PolicyGate<
     metrics: M,
 }
 
-impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, D: TimeDriver, P> Clone
+impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics + Clone, D: TimeDriver, P> Clone
     for PolicyGate<T, C, M, D, P>
 {
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
-            metrics: self.metrics,
+            metrics: self.metrics.clone(),
         }
     }
 }
 
-impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, D: TimeDriver, P> core::fmt::Debug
-    for PolicyGate<T, C, M, D, P>
+impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics + Clone, D: TimeDriver, P>
+    core::fmt::Debug for PolicyGate<T, C, M, D, P>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PolicyGate")
@@ -284,7 +284,7 @@ impl<T: Subject, C: DecisionSource<T, P>, P: Send + Sync + 'static>
 }
 
 #[cfg(feature = "tokio")]
-impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, P: Send + Sync + 'static>
+impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics + Clone, P: Send + Sync + 'static>
     PolicyGate<T, C, M, TokioTimeDriver, P>
 {
     /// Constructs a gate with caller-owned metric handling.
@@ -318,7 +318,7 @@ impl<T: Subject, C: DecisionSource<T, P>, D: TimeDriver, P: Send + Sync + 'stati
 impl<
     T: Subject,
     C: DecisionSource<T, P>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     D: TimeDriver,
     P: Send + Sync + 'static,
 > PolicyGate<T, C, M, D, P>
@@ -333,12 +333,17 @@ impl<
     ) -> crate::PolicyGateParts<T, C, M, D, P> {
         let (connected, connectivity) = async_watch::channel(false);
         let refresh_queue_capacity = config.refresh_queue_capacity();
-        let (state, refresh_rx) =
-            GateState::new(Arc::clone(&client), config, metrics, time, connectivity);
+        let (state, refresh_rx) = GateState::new(
+            Arc::clone(&client),
+            config,
+            metrics.clone(),
+            time,
+            connectivity,
+        );
         let (watcher, health) = DecisionWatcher::new(
             Arc::clone(&state),
             client,
-            metrics,
+            metrics.clone(),
             connected,
             refresh_rx,
             refresh_queue_capacity,
@@ -395,10 +400,10 @@ impl<
         async move { state.refresh_entry(&subject, &admission.entry).await }
     }
 
-    /// Returns a copy of the caller-provided metrics handle.
+    /// Returns a clone of the caller-provided metrics handle.
     #[must_use]
-    pub const fn metrics(&self) -> M {
-        self.metrics
+    pub fn metrics(&self) -> M {
+        self.metrics.clone()
     }
 
     #[cfg(feature = "tower-layer")]
@@ -887,7 +892,8 @@ struct PublishState {
 }
 
 /// Owns authoritative subject state and its cached read snapshot.
-pub(crate) struct GateState<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, D, P> {
+pub(crate) struct GateState<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics + Clone, D, P>
+{
     client: Arc<C>,
     connected: Receiver<bool>,
     disconnected_since: Arc<Mutex<Option<Instant>>>,
@@ -903,8 +909,8 @@ pub(crate) struct GateState<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMe
     _time: PhantomData<D>,
 }
 
-impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, D: TimeDriver, P> core::fmt::Debug
-    for GateState<T, C, M, D, P>
+impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics + Clone, D: TimeDriver, P>
+    core::fmt::Debug for GateState<T, C, M, D, P>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("GateState")
@@ -916,7 +922,7 @@ impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, D: TimeDriver, P
 impl<
     T: Subject,
     C: DecisionSource<T, P>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     D: TimeDriver,
     P: Send + Sync + 'static,
 > GateState<T, C, M, D, P>
@@ -1202,7 +1208,7 @@ impl<
     ) -> Arc<PendingFetch> {
         // `delay` is the permanent-failure cooldown; it starts when the first joiner polls.
         let client = Arc::clone(&self.client);
-        let metrics = self.metrics;
+        let metrics = self.metrics.clone();
         let unary_timeout = self.config.unary_timeout();
         let gate = Arc::downgrade(self);
         let generation = Generation::new(());
@@ -1549,7 +1555,7 @@ impl<
     }
 }
 
-impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics, D: TimeDriver, P>
+impl<T: Subject, C: DecisionSource<T, P>, M: PolicyGateMetrics + Clone, D: TimeDriver, P>
     GateState<T, C, M, D, P>
 {
     fn publish_empty(&self, after_publish: impl FnOnce()) {

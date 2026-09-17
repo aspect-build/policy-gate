@@ -21,7 +21,7 @@ pub(crate) struct EnforcedBody<
     B,
     T: Subject,
     C: DecisionSource<T>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: StreamRejectionResponse,
     D,
 > {
@@ -41,7 +41,7 @@ impl<
     B,
     T: Subject,
     C: DecisionSource<T>,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: StreamRejectionResponse,
     D: TimeDriver,
 > EnforcedBody<B, T, C, M, R, D>
@@ -74,7 +74,7 @@ where
     B::Error: Into<BoxBodyError>,
     T: Subject,
     C: DecisionSource<T> + 'static,
-    M: PolicyGateMetrics,
+    M: PolicyGateMetrics + Clone,
     R: StreamRejectionResponse,
     D: TimeDriver,
 {
