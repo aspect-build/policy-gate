@@ -28,7 +28,13 @@
 //! never extends a decision's deadline. Handles and admissions check expiry on access; stream bodies
 //! cut off expired decisions on their next poll. A configured refresh window starts one background
 //! refresh when a cached decision is read shortly before expiry. Time alone never wakes an idle
-//! stream.
+//! stream. A failed refresh does not extend the deadline and may be retried by a later read
+//! after [`PolicyGateConfig::permanent_failure_cooldown`], regardless of the error kind.
+//!
+//! Retained handles report the refresh window through [`Admission::check`]; callers can spawn
+//! [`PolicyGate::refresh`] when due, as shown in the
+//! [caller loop](https://github.com/aspect-build/policy-gate#decision-freshness).
+//!
 //! [`PolicyGateConfig::subject_ttl`] remains the separate sliding idle-cache eviction policy.
 //!
 //! # Example
@@ -389,6 +395,10 @@ impl PolicyGateConfig {
     }
 
     /// Minimum spacing between lookups for a subject whose last lookup failed permanently.
+    ///
+    /// Also the minimum spacing between background refresh attempts after a failed refresh,
+    /// regardless of error kind. Zero allows retry on the next read. Enqueue timeouts and
+    /// cancelled refreshes do not start this cooldown.
     #[must_use]
     pub const fn permanent_failure_cooldown(&self) -> Duration {
         self.permanent_failure_cooldown
@@ -453,7 +463,8 @@ impl PolicyGateConfig {
     }
 
     /// Window before decision expiry in which a cached subject read starts a background refresh.
-    /// Zero disables background refresh.
+    /// Zero disables background refresh. Retained [`Admission`] handles report the window through
+    /// [`Admission::check`]; the caller then starts work with [`PolicyGate::refresh`].
     #[must_use]
     pub const fn refresh_before_expiry(&self) -> Duration {
         self.refresh_before_expiry
@@ -575,8 +586,8 @@ impl PolicyGateConfigBuilder {
         self
     }
 
-    /// Sets the window before expiry in which a cached decision read triggers a refresh.
-    /// Zero disables background refresh.
+    /// Sets [`PolicyGateConfig::refresh_before_expiry`]. Defaults to
+    /// [`DEFAULT_REFRESH_BEFORE_EXPIRY`].
     #[must_use]
     pub const fn refresh_before_expiry(mut self, refresh_before: Duration) -> Self {
         self.candidate.refresh_before_expiry = refresh_before;

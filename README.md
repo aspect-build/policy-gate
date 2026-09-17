@@ -56,7 +56,7 @@ admission handles stale. Dropping a Tokio task's `JoinHandle` only detaches the 
 cancel it. Decision-source loss fails new admission closed after the configured deadline; already
 admitted streams observe `Stale` and may continue while readmission is attempted.
 
-Admission handles expose only synchronous `state()` and `is_allowed()` checks. Authority changes
+Admission handles expose synchronous `state()`, `is_allowed()`, and `check()` checks. Authority changes
 never wake an otherwise idle connection: denial is enforced on its next body poll, and ordinary
 stale state starts readmission then. `PolicyGate::admit()` is the async coordination point and
 concurrent calls for the same subject join one in-flight authority lookup.
@@ -89,9 +89,46 @@ before delivering more traffic. With the default zero refresh window, an entirel
 idle: there is no expiration timer, background scan, or authority-change observer. With a nonzero
 refresh window, the first cache read within that window starts one background lookup. Concurrent
 reads do not start another lookup while it is pending. A failed refresh does not extend the
-deadline and may be retried by a later read. A cached access waits at most
+deadline and may be retried by a later read after `permanent_failure_cooldown`, regardless of the
+error kind. A zero cooldown permits retry on the next read. Enqueue timeouts and cancellation do
+not start a cooldown. A cached access waits at most
 `refresh_enqueue_timeout` (100 ms by default) for queue capacity. A new watch decision installs a new
 absolute deadline; watch disconnects and eviction retain their existing stale/readmission recovery
 behavior. The default `DEFAULT_DECISION_FRESHNESS_TTL` is exactly `Duration::MAX`, a never-expire
 sentinel that is not converted into an `Instant`. Freshness and background refresh are disabled by
 default, so existing users retain the original request and unary-call behavior.
+
+For a retained admission on a long-lived outbound Tonic stream, use `check()` on each event and
+let the caller spawn `refresh()`. The existing handle observes a successful renewal in place.
+Keep at most one refresh task in flight per stream, because the signal stays true until the task
+claims the entry. For example, in a handler returning `Result<_, tonic::Status>`:
+
+```rust,ignore
+use policy_gate::AdmissionState;
+
+let admission = gate.admit(&subject).await
+    .map_err(|_| tonic::Status::unavailable("policy unavailable"))?;
+let mut refresh: Option<tokio::task::JoinHandle<()>> = None;
+while let Some(event) = outbound.message().await? {
+    let (state, refresh_due) = admission.check();
+    match state {
+        AdmissionState::Allowed => {}
+        AdmissionState::Denied => return Err(tonic::Status::failed_precondition("policy denied")),
+        AdmissionState::Stale => return Err(tonic::Status::unavailable("policy stale")),
+    }
+    if refresh_due && refresh.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
+        refresh = Some(tokio::spawn(gate.refresh(subject.clone(), admission.clone())));
+    }
+    handle(event).await?;
+}
+```
+
+`check()` never starts a lookup or renews `subject_ttl`; configure that TTL to cover the
+pre-refresh idle interval, or later map activity may evict the entry before its first refresh.
+`refresh()` renews the matching entry's idle TTL even outside the refresh window; a mismatched subject or replaced entry is a
+no-op. Its future only hands work to the watcher and waits at most `refresh_enqueue_timeout`
+for queue capacity. Dropping its task handle detaches it; aborting during enqueue safely releases
+the claim. The library spawns no tasks. Choose a refresh window larger than the event gaps you
+need to cover: no events means no refresh, and the first event after expiry sees `Stale`.
+`state()` and `is_allowed()` remain observation-only. The Tower body wrapper does not start
+retained-handle refreshes automatically.
