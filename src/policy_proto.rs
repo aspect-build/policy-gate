@@ -296,6 +296,12 @@ pub mod policy_authority_server {
     /// Generated trait containing gRPC methods that should be implemented for use with PolicyAuthorityServer.
     #[async_trait]
     pub trait PolicyAuthority: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the WatchSubjectDecisions method.
+        type WatchSubjectDecisionsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::SubjectDecisionChange, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         /// Returns the decision in force for one subject.
         ///
         /// The authority MUST answer a subject it holds no decision for with
@@ -311,12 +317,6 @@ pub mod policy_authority_server {
             tonic::Response<super::GetSubjectDecisionResponse>,
             tonic::Status,
         >;
-        /// Server streaming response type for the WatchSubjectDecisions method.
-        type WatchSubjectDecisionsStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::SubjectDecisionChange, tonic::Status>,
-            >
-            + std::marker::Send
-            + 'static;
         /// Streams decision changes for every subject in one scope.
         ///
         /// The stream carries changes only. The authority is not required to open it with a

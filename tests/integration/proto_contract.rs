@@ -36,11 +36,11 @@ fn canonical_policy_proto_matches_generated_rust() {
 
     let generated = output.join("aspect.policy.gate.v1.rs");
     let checked_in = root.join("src/policy_proto.rs");
-    let generated = format!(
-        "// Copyright 2026 Aspect Build Systems, Inc. All rights reserved.\n\n{}",
-        fs::read_to_string(&generated)
-            .unwrap_or_else(|error| panic!("reading generated policy proto: {error}"))
-    );
+    let mut generated = fs::read_to_string(&generated)
+        .unwrap_or_else(|error| panic!("reading generated policy proto: {error}"));
+    move_watch_stream_type_to_trait_start(&mut generated);
+    let generated =
+        format!("// Copyright 2026 Aspect Build Systems, Inc. All rights reserved.\n\n{generated}");
     if std::env::var_os("UPDATE_POLICY_PROTO").is_some() {
         fs::write(&checked_in, &generated)
             .unwrap_or_else(|error| panic!("updating generated policy proto: {error}"));
@@ -54,4 +54,28 @@ fn canonical_policy_proto_matches_generated_rust() {
         );
     }
     fs::remove_dir_all(output).unwrap_or_else(|error| panic!("removing output directory: {error}"));
+}
+
+fn move_watch_stream_type_to_trait_start(generated: &mut String) {
+    const TRAIT: &str =
+        "    pub trait PolicyAuthority: std::marker::Send + std::marker::Sync + 'static {\n";
+    const STREAM_TYPE: &str =
+        "        /// Server streaming response type for the WatchSubjectDecisions method.\n";
+    const WATCH_METHOD: &str =
+        "        /// Streams decision changes for every subject in one scope.\n";
+
+    let start = generated
+        .find(STREAM_TYPE)
+        .unwrap_or_else(|| panic!("generated policy proto has no watch stream type"));
+    let end = start
+        + generated[start..]
+            .find(WATCH_METHOD)
+            .unwrap_or_else(|| panic!("generated policy proto has no watch method"));
+    let stream_type = generated[start..end].to_owned();
+    generated.replace_range(start..end, "");
+    let insert = generated.find(TRAIT).map_or_else(
+        || panic!("generated policy proto has no authority trait"),
+        |position| position + TRAIT.len(),
+    );
+    generated.insert_str(insert, &stream_type);
 }
