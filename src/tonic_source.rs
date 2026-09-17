@@ -20,22 +20,6 @@ use crate::{
     Decision, DecisionChange, DecisionSource, DecisionSourceError, DecisionSourceErrorKind, Subject,
 };
 
-/// Compatibility policy for authority scope echoes.
-///
-/// The authority echoes the requested scope in every unary response and watch change; validating
-/// it keeps a misrouted or misconfigured authority from supplying verdicts for another scope.
-/// Relax it only while rolling out an authority that does not yet echo.
-///
-/// Requires the `tonic-client` feature.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ScopeEchoPolicy {
-    /// Require every unary response and watch change to echo the bound scope exactly.
-    #[default]
-    Strict,
-    /// Temporarily accept an empty echo while still rejecting every non-empty mismatch.
-    AllowEmpty,
-}
-
 /// Endpoint and scope configuration for the lazy tonic policy decision source.
 ///
 /// Consumed by [`TonicDecisionSource::connect_lazy`].
@@ -46,7 +30,6 @@ pub struct TonicDecisionSourceConfig {
     endpoint: String,
     scope: String,
     connect_timeout: Duration,
-    scope_echo_policy: ScopeEchoPolicy,
 }
 
 impl TonicDecisionSourceConfig {
@@ -61,7 +44,6 @@ impl TonicDecisionSourceConfig {
             endpoint: endpoint.into(),
             scope: scope.into(),
             connect_timeout: Duration::from_secs(2),
-            scope_echo_policy: ScopeEchoPolicy::Strict,
         }
     }
 
@@ -69,13 +51,6 @@ impl TonicDecisionSourceConfig {
     #[must_use]
     pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
-        self
-    }
-
-    /// Sets how strictly the authority's scope echo is validated.
-    #[must_use]
-    pub const fn with_scope_echo_policy(mut self, policy: ScopeEchoPolicy) -> Self {
-        self.scope_echo_policy = policy;
         self
     }
 
@@ -95,12 +70,6 @@ impl TonicDecisionSourceConfig {
     #[must_use]
     pub const fn connect_timeout(&self) -> Duration {
         self.connect_timeout
-    }
-
-    /// Returns the configured scope-echo validation policy.
-    #[must_use]
-    pub const fn scope_echo_policy(&self) -> ScopeEchoPolicy {
-        self.scope_echo_policy
     }
 }
 
@@ -138,7 +107,6 @@ impl core::error::Error for TonicDecisionSourceConfigError {}
 pub struct TonicDecisionSource<T> {
     client: PolicyAuthorityClient<Channel>,
     scope: Arc<str>,
-    scope_echo_policy: ScopeEchoPolicy,
     subject: PhantomData<fn() -> T>,
 }
 
@@ -152,7 +120,6 @@ pub struct TonicDecisionSource<T> {
 pub struct TonicDecisionStream<T> {
     inner: tonic::Streaming<ProtoSubjectDecisionChange>,
     scope: Arc<str>,
-    scope_echo_policy: ScopeEchoPolicy,
     subject: PhantomData<fn() -> T>,
 }
 
@@ -172,7 +139,7 @@ impl<T: FromStr> Stream for TonicDecisionStream<T> {
         Poll::Ready(result.map(|result| {
             result
                 .map_err(|status| source_error(&status))
-                .and_then(|change| decode_change(&change, &this.scope, this.scope_echo_policy))
+                .and_then(|change| decode_change(&change, &this.scope))
         }))
     }
 }
@@ -184,21 +151,9 @@ impl<T> TonicDecisionSource<T> {
     /// interceptors of its own.
     #[must_use]
     pub fn from_channel(channel: Channel, scope: impl Into<Arc<str>>) -> Self {
-        Self::from_channel_with_scope_echo_policy(channel, scope, ScopeEchoPolicy::Strict)
-    }
-
-    /// Builds a scope-bound client around a host-prepared channel with an explicit rollout
-    /// compatibility policy.
-    #[must_use]
-    pub fn from_channel_with_scope_echo_policy(
-        channel: Channel,
-        scope: impl Into<Arc<str>>,
-        scope_echo_policy: ScopeEchoPolicy,
-    ) -> Self {
         Self {
             client: PolicyAuthorityClient::new(channel),
             scope: scope.into(),
-            scope_echo_policy,
             subject: PhantomData,
         }
     }
@@ -222,10 +177,9 @@ impl<T> TonicDecisionSource<T> {
             .keep_alive_while_idle(true)
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .connect_timeout(config.connect_timeout);
-        Ok(Self::from_channel_with_scope_echo_policy(
+        Ok(Self::from_channel(
             endpoint.connect_lazy(),
             Arc::<str>::from(config.scope.as_str()),
-            config.scope_echo_policy,
         ))
     }
 }
@@ -249,7 +203,7 @@ where
             .await
             .map_err(|status| source_error(&status))?
             .into_inner();
-        decode_response(&response, &self.scope, self.scope_echo_policy)
+        decode_response(&response, &self.scope)
     }
 
     async fn watch_subject_decisions(&self) -> Result<Self::Changes, DecisionSourceError> {
@@ -264,7 +218,6 @@ where
         Ok(TonicDecisionStream {
             inner: stream,
             scope: Arc::clone(&self.scope),
-            scope_echo_policy: self.scope_echo_policy,
             subject: PhantomData,
         })
     }
@@ -273,18 +226,16 @@ where
 fn decode_response(
     response: &GetSubjectDecisionResponse,
     scope: &str,
-    policy: ScopeEchoPolicy,
 ) -> Result<Option<Decision>, DecisionSourceError> {
-    validate_scope_echo(scope, &response.scope, policy)?;
+    validate_scope_echo(scope, &response.scope)?;
     decode_decision(response.decision)
 }
 
 fn decode_change<T: FromStr>(
     change: &ProtoSubjectDecisionChange,
     scope: &str,
-    policy: ScopeEchoPolicy,
 ) -> Result<DecisionChange<T>, DecisionSourceError> {
-    validate_scope_echo(scope, &change.scope, policy)?;
+    validate_scope_echo(scope, &change.scope)?;
     let subject = change.subject_id.parse().map_err(|_| {
         DecisionSourceError::new(
             DecisionSourceErrorKind::Wire,
@@ -297,12 +248,8 @@ fn decode_change<T: FromStr>(
     })
 }
 
-fn validate_scope_echo(
-    expected: &str,
-    actual: &str,
-    policy: ScopeEchoPolicy,
-) -> Result<(), DecisionSourceError> {
-    if actual == expected || (actual.is_empty() && policy == ScopeEchoPolicy::AllowEmpty) {
+fn validate_scope_echo(expected: &str, actual: &str) -> Result<(), DecisionSourceError> {
+    if actual == expected {
         return Ok(());
     }
     Err(DecisionSourceError::new(

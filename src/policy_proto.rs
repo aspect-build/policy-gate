@@ -25,11 +25,8 @@ pub struct GetSubjectDecisionResponse {
     pub decision: i32,
     /// Scope the decision was evaluated in.
     ///
-    /// The authority MUST echo the request's scope. A client rejects a non-empty mismatch
-    /// as a protocol failure, which keeps a misrouted or misconfigured authority from
-    /// supplying verdicts for another scope. An empty echo is rejected the same way unless
-    /// the client is configured to tolerate it while an authority that does not yet echo
-    /// rolls out.
+    /// The authority MUST echo the request's scope exactly. A client rejects a mismatch
+    /// as a protocol failure, preventing an authority from supplying another scope's verdicts.
     #[prost(string, tag = "2")]
     pub scope: ::prost::alloc::string::String,
 }

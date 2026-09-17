@@ -199,8 +199,8 @@ pub use metrics::{NoopPolicyGateMetrics, PolicyGateMetrics};
 pub use time::{TimeDriver, TimeoutElapsed, TokioTimeDriver};
 #[cfg(feature = "tonic-client")]
 pub use tonic_source::{
-    ScopeEchoPolicy, TonicDecisionSource, TonicDecisionSourceConfig,
-    TonicDecisionSourceConfigError, TonicDecisionStream,
+    TonicDecisionSource, TonicDecisionSourceConfig, TonicDecisionSourceConfigError,
+    TonicDecisionStream,
 };
 pub use watcher::{DecisionSourceHealth, DecisionSourceHealthStatus, DecisionWatcher};
 
