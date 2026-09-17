@@ -255,6 +255,14 @@ pub enum Decision {
 pub struct DecisionResult<P = ()> {
     pub decision: Decision,
     pub payload: Option<Arc<P>>,
+    /// Anchored upper bound on this decision and payload's validity, in the gate's
+    /// [`TimeDriver`] clock domain. `None` uses configured freshness; `Some` caps it
+    /// without extending it. Reusing a result must retain the original deadline.
+    /// Results expired at publication are transient failures: admission backs off, while
+    /// refresh retains the prior unexpired snapshot and applies failure cooldown.
+    /// Successful results that land inside the refresh window wait half their remaining
+    /// effective lifetime before becoming eligible for refresh.
+    pub valid_until: Option<Instant>,
 }
 
 /// One normalized authoritative subject-state update.
@@ -460,8 +468,8 @@ impl PolicyGateConfig {
     /// Absolute age after which an authoritative decision is no longer usable.
     ///
     /// Unlike [`PolicyGateConfig::subject_ttl`], ordinary access does not extend this deadline.
-    /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables decision freshness checks and preserves the
-    /// original cache behavior. The sentinel is never converted into an [`Instant`] deadline.
+    /// [`DEFAULT_DECISION_FRESHNESS_TTL`] disables the configured freshness limit; a source's
+    /// [`DecisionResult::valid_until`] cap still applies. The sentinel is never converted into an [`Instant`] deadline.
     /// Pair a finite TTL with [`PolicyGateConfig::refresh_before_expiry`] to refresh cached
     /// decisions on access before this deadline.
     #[must_use]
