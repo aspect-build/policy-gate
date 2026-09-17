@@ -988,10 +988,12 @@ impl<
             .valid_until
             .map_or(configured, |cap| configured.min(entry.tick(cap)));
         // A cap inside the refresh window must not cause immediate successful refreshes.
-        let refresh_after = result.valid_until.map_or(0, |_| {
-            let now = entry.tick(now);
-            now + deadline.saturating_sub(now).div_ceil(2)
-        });
+        let remaining = deadline.saturating_sub(entry.tick(now));
+        let refresh_after = if remaining <= entry.refresh_before {
+            entry.tick(now) + remaining.div_ceil(2)
+        } else {
+            0
+        };
         Arc::new(EntrySnapshot(
             Entry::<P>::word(result.decision.into(), deadline),
             result
@@ -1247,6 +1249,17 @@ impl<
                         "decision source panicked",
                     ))
                 });
+                let result = if let (Some(gate), Some(entry)) = (gate.upgrade(), entry.upgrade()) {
+                    gate.apply_fetch_result(
+                        &subject,
+                        &entry,
+                        &completion_generation,
+                        refresh_from.as_ref(),
+                        result,
+                    )
+                } else {
+                    result.map(|_| ())
+                };
                 if result
                     .as_ref()
                     .is_err_and(|error| error.kind() == DecisionSourceErrorKind::Wire)
@@ -1256,16 +1269,7 @@ impl<
                 if result.is_err() {
                     metrics.unary_failure();
                 }
-                if let (Some(gate), Some(entry)) = (gate.upgrade(), entry.upgrade()) {
-                    gate.apply_fetch_result(
-                        &subject,
-                        &entry,
-                        &completion_generation,
-                        refresh_from.as_ref(),
-                        result.as_ref(),
-                    );
-                }
-                result.map(|_| ())
+                result
             },
             registration,
         )
@@ -1284,17 +1288,30 @@ impl<
         entry: &Arc<Entry<P>>,
         generation: &Generation,
         refresh_from: Option<&Arc<EntrySnapshot<P>>>,
-        result: Result<&DecisionResult<P>, &DecisionSourceError>,
-    ) {
+        result: Result<DecisionResult<P>, DecisionSourceError>,
+    ) -> FetchResult {
         if entry.pending_generation(generation).is_none() {
-            return;
+            return result.map(|_| ());
         }
+        // Validate the prepared effective snapshot, not just the source's earlier timestamp.
+        let result = result.map(|result| self.decision_snapshot(entry, &result));
+        let now = D::now();
+        let result = result.and_then(|snapshot| {
+            if entry.is_expired_at(snapshot.0, now) {
+                Err(DecisionSourceError::new(
+                    DecisionSourceErrorKind::Transient,
+                    "decision expired before publication",
+                ))
+            } else {
+                Ok(snapshot)
+            }
+        });
         if let Some(current) = refresh_from {
-            if let Ok(result) = result {
-                if !entry.is_expired_at(current.0, D::now()) {
+            if let Ok(snapshot) = &result {
+                if !entry.is_expired_at(current.0, now) {
                     entry
                         .current
-                        .compare_and_swap(current, self.decision_snapshot(entry, result));
+                        .compare_and_swap(current, Arc::clone(snapshot));
                 }
             } else {
                 let cooldown = u64::try_from(self.config.permanent_failure_cooldown().as_nanos())
@@ -1305,20 +1322,20 @@ impl<
                 );
             }
             entry.replace_pending(generation, None);
-            return;
+            return result.map(|_| ());
         }
-        if let Ok(result) = result {
+        if let Ok(snapshot) = &result {
             // A watch event that wins this CAS supplies the verdict that stands.
             if entry
-                .compare_exchange(EntryState::Pending, &self.decision_snapshot(entry, result))
+                .compare_exchange(EntryState::Pending, snapshot)
                 .is_ok()
             {
                 entry.replace_pending(generation, None);
             }
-            return;
+            return result.map(|_| ());
         }
 
-        if result.is_err_and(is_permanent_status) {
+        if result.as_ref().is_err_and(is_permanent_status) {
             if matches!(entry.state_at(D::now()), EntryState::Pending) {
                 let retry = self.new_fetch_after(
                     Arc::downgrade(entry),
@@ -1328,7 +1345,7 @@ impl<
                 );
                 entry.replace_pending(generation, Some(retry));
             }
-            return;
+            return result.map(|_| ());
         }
 
         // remove_if runs its predicate under the map lock, making the
@@ -1352,6 +1369,7 @@ impl<
             self.shape_dirty.store(true, Ordering::Release);
         }
         self.republish_if_due();
+        result.map(|_| ())
     }
 
     fn admission_timed_out(&self) -> Option<Admission<D, P>> {

@@ -102,11 +102,11 @@ A source may override `DecisionSource::get_subject_decision_result` and return
 `DecisionResult<P> { decision, payload, valid_until }`. `valid_until: None` preserves configured
 freshness. `Some(deadline)` caps both decision and payload validity, even when configured freshness
 is disabled. Use the gate's `TimeDriver` clock domain and retain the original `Instant` when reusing
-a result; each lookup must not restart its lifetime. An already-expired result uses admission retry
+a result; each lookup must not restart its lifetime. A result expired at publication uses admission retry
 backoff or, during refresh, preserves the prior unexpired snapshot and starts failure cooldown.
-A successful capped result waits at least half its remaining effective lifetime before becoming
-refresh-eligible, in addition to the configured refresh window. Existing sources implementing only
-the binary lookup continue to use the default adapter without changes.
+A successful result that already lands inside the refresh window waits half its remaining effective
+lifetime before becoming refresh-eligible. Results outside that window keep the configured refresh start.
+Existing sources implementing only the binary lookup continue to use the default adapter without changes.
 
 For a retained admission on a long-lived outbound Tonic stream, use `check()` on each event and
 let the caller spawn `refresh()`. The existing handle observes a successful renewal in place.

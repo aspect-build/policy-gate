@@ -332,6 +332,12 @@ async fn unrepresentable_deadline_fails_closed() {
         let subject = SUBJECT_A.parse().expect("test subject UUID");
         gate.admit(&subject).await
     });
+    // An unusable effective snapshot takes admission backoff before the next lookup.
+    wait_for_metric(&runtime.metrics.admission_retries, 1).await;
+    runtime
+        .time
+        .advance(config.initial_admission_retry_delay)
+        .await;
     source.wait_for_gets(2).await;
 
     runtime.time.advance(config.admission_timeout).await;

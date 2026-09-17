@@ -258,10 +258,10 @@ pub struct DecisionResult<P = ()> {
     /// Anchored upper bound on this decision and payload's validity, in the gate's
     /// [`TimeDriver`] clock domain. `None` uses configured freshness; `Some` caps it
     /// without extending it. Reusing a result must retain the original deadline.
-    /// Already-expired results are transient failures: admission backs off, while
+    /// Results expired at publication are transient failures: admission backs off, while
     /// refresh retains the prior unexpired snapshot and applies failure cooldown.
-    /// Successful capped results wait at least half their remaining effective lifetime
-    /// before becoming eligible for refresh within the configured refresh window.
+    /// Successful results that land inside the refresh window wait half their remaining
+    /// effective lifetime before becoming eligible for refresh.
     pub valid_until: Option<Instant>,
 }
 

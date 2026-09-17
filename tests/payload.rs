@@ -383,3 +383,146 @@ async fn expired_refresh_retains_snapshot_and_short_success_waits_half_its_lifet
     assert_eq!(admission.check(), (AdmissionState::Stale, false));
     assert!(admission.payload().is_none());
 }
+
+mod publication_crossing {
+    use super::*;
+    use core::cell::Cell;
+    use core::task::Poll;
+    use std::sync::OnceLock;
+
+    use policy_gate::TimeDriver;
+
+    std::thread_local! {
+        static MILLIS: Cell<u64> = const { Cell::new(0) };
+        static ADVANCE_AFTER_READ: Cell<bool> = const { Cell::new(false) };
+    }
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+    #[derive(Clone)]
+    struct Clock;
+    impl TimeDriver for Clock {
+        fn now() -> Instant {
+            let now = *EPOCH.get_or_init(Instant::now) + Duration::from_millis(MILLIS.get());
+            // Let the source-level check see a live result, then cross its anchored expiry.
+            if ADVANCE_AFTER_READ.replace(false) {
+                MILLIS.set(MILLIS.get() + 2);
+            }
+            now
+        }
+        fn sleep_until(deadline: Instant) -> impl Future<Output = ()> + Send {
+            core::future::poll_fn(move |_| {
+                if Self::now() >= deadline {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+        }
+        fn yield_now() -> impl Future<Output = ()> + Send {
+            core::future::ready(())
+        }
+    }
+
+    struct CrossingSource {
+        calls: AtomicUsize,
+        crossing_call: usize,
+    }
+    impl DecisionSource<u8, Payload> for CrossingSource {
+        type Changes = futures_util::stream::Pending<Change>;
+
+        fn get_subject_decision(
+            &self,
+            _: &u8,
+        ) -> impl Future<Output = Result<Option<Decision>, DecisionSourceError>> + Send {
+            core::future::ready(Ok(Some(Decision::Allowed)))
+        }
+        fn get_subject_decision_result(&self, _: &u8) -> impl Future<Output = Reply> + Send {
+            // Arm the crossing only when polled, after the unary timeout is initialized.
+            futures_util::future::lazy(move |_| {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == self.crossing_call {
+                    let deadline = Clock::now() + Duration::from_millis(1);
+                    ADVANCE_AFTER_READ.set(true);
+                    Ok(Some(capped("crossing", deadline)))
+                } else {
+                    // A nonbinding cap preserves the configured refresh start.
+                    Ok(Some(capped(
+                        "stable",
+                        Clock::now() + Duration::from_secs(1),
+                    )))
+                }
+            })
+        }
+        fn watch_subject_decisions(
+            &self,
+        ) -> impl Future<Output = Result<Self::Changes, DecisionSourceError>> + Send {
+            core::future::ready(Ok(futures_util::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_expiry_crossing_at_publication_takes_retry_backoff() {
+        MILLIS.set(0);
+        let source = Arc::new(CrossingSource {
+            calls: AtomicUsize::new(0),
+            crossing_call: 0,
+        });
+        let config = PolicyGateConfig::builder()
+            .initial_admission_retry_delay(Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let (gate, mut watcher, _) =
+            PolicyGate::new_with_time_driver(&config, Arc::clone(&source), Clock);
+        assert!(poll!(&mut watcher).is_pending());
+        let mut admit = Box::pin(gate.admit(&1));
+        assert!(poll!(&mut admit).is_pending());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(MILLIS.get(), 2);
+        MILLIS.set(11);
+        assert!(poll!(&mut admit).is_pending());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+        MILLIS.set(12);
+        assert_eq!(admit.await.unwrap().payload().unwrap().0, "stable");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_expiry_crossing_keeps_exact_prior_payload_and_cooldown() {
+        MILLIS.set(0);
+        let source = Arc::new(CrossingSource {
+            calls: AtomicUsize::new(0),
+            crossing_call: 1,
+        });
+        let config = PolicyGateConfig::builder()
+            .decision_freshness_ttl(Duration::from_millis(100))
+            .refresh_before_expiry(Duration::from_millis(90))
+            .permanent_failure_cooldown(Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let (gate, mut watcher, _) =
+            PolicyGate::new_with_time_driver(&config, Arc::clone(&source), Clock);
+        assert!(poll!(&mut watcher).is_pending());
+        let admission = gate.admit(&1).await.unwrap();
+        let old_payload = admission.payload().unwrap();
+        MILLIS.set(9);
+        assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+        MILLIS.set(10);
+        assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+        gate.refresh(1, admission.clone()).await;
+        assert!(poll!(&mut watcher).is_pending());
+        assert_eq!(MILLIS.get(), 12);
+        assert!(Arc::ptr_eq(&old_payload, &admission.payload().unwrap()));
+        assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+        MILLIS.set(21);
+        gate.refresh(1, admission.clone()).await;
+        assert!(poll!(&mut watcher).is_pending());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(admission.check(), (AdmissionState::Allowed, false));
+        MILLIS.set(22);
+        assert_eq!(admission.check(), (AdmissionState::Allowed, true));
+        MILLIS.set(99);
+        assert!(Arc::ptr_eq(&old_payload, &admission.payload().unwrap()));
+        MILLIS.set(100);
+        assert_eq!(admission.state(), AdmissionState::Stale);
+    }
+}
