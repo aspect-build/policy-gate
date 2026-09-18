@@ -80,8 +80,15 @@ message GetSubjectDecisionResponse {
   // The authority MUST echo the request's scope exactly. A client rejects a mismatch
   // as a protocol failure, preventing an authority from supplying another scope's verdicts.
   string scope = 2;
+  // Additional data supplied by the authority for this subject's decision.
+  //
+  // Its meaning is defined entirely by the scope. The payload is opaque on the wire:
+  // policy-gate neither parses nor validates its contents. The authority MUST leave
+  // this field empty when it has no payload for the subject. Clients that use it MUST
+  // interpret and validate it according to their scope's contract before admitting work.
+  string payload = 3;
 
-  // NextId: 3
+  // NextId: 4
 }
 
 // Opens one scope's change stream.

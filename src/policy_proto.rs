@@ -29,6 +29,14 @@ pub struct GetSubjectDecisionResponse {
     /// as a protocol failure, preventing an authority from supplying another scope's verdicts.
     #[prost(string, tag = "2")]
     pub scope: ::prost::alloc::string::String,
+    /// Additional data supplied by the authority for this subject's decision.
+    ///
+    /// Its meaning is defined entirely by the scope. The payload is opaque on the wire:
+    /// policy-gate neither parses nor validates its contents. The authority MUST leave
+    /// this field empty when it has no payload for the subject. Clients that use it MUST
+    /// interpret and validate it according to their scope's contract before admitting work.
+    #[prost(string, tag = "3")]
+    pub payload: ::prost::alloc::string::String,
 }
 /// Opens one scope's change stream.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
