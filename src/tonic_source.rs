@@ -17,7 +17,8 @@ use futures_core::Stream;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::{
-    Decision, DecisionChange, DecisionSource, DecisionSourceError, DecisionSourceErrorKind, Subject,
+    Decision, DecisionChange, DecisionResult, DecisionSource, DecisionSourceError,
+    DecisionSourceErrorKind, Subject,
 };
 
 /// Endpoint and scope configuration for the lazy tonic policy decision source.
@@ -145,6 +146,44 @@ impl<T: FromStr> Stream for TonicDecisionStream<T> {
 }
 
 impl<T> TonicDecisionSource<T> {
+    /// Fetches a decision with the authority's opaque, scope-defined payload.
+    ///
+    /// An empty string (including a response from an authority predating the payload field)
+    /// becomes `payload: None`; a non-empty string is preserved without parsing or validation.
+    /// The caller must interpret and validate it according to the scope's contract.
+    /// `valid_until` is always `None`; the caller owns any deadline calculation.
+    /// `DECISION_UNSPECIFIED` returns `Ok(None)`, regardless of the payload.
+    /// The [`DecisionSource`] implementation remains decision-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same scope-echo, unknown-decision, and classified gRPC failures as
+    /// [`DecisionSource::get_subject_decision`].
+    pub async fn get_subject_decision_with_payload(
+        &self,
+        subject: &T,
+    ) -> Result<Option<DecisionResult<String>>, DecisionSourceError>
+    where
+        T: Display,
+    {
+        let mut client = self.client.clone();
+        let response = client
+            .get_subject_decision(GetSubjectDecisionRequest {
+                subject_id: subject.to_string(),
+                scope: self.scope.to_string(),
+            })
+            .await
+            .map_err(|status| source_error(&status))?
+            .into_inner();
+        Ok(
+            decode_response(&response, &self.scope)?.map(|decision| DecisionResult {
+                decision,
+                payload: (!response.payload.is_empty()).then(|| Arc::new(response.payload)),
+                valid_until: None,
+            }),
+        )
+    }
+
     /// Builds a strict scope-bound client around a host-prepared channel.
     ///
     /// Use it when the host already owns the channel, for example to apply TLS, load balancing, or
