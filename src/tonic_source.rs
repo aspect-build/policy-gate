@@ -159,12 +159,16 @@ impl<T> TonicDecisionSource<T> {
     ///
     /// Returns the same scope-echo, unknown-decision, and classified gRPC failures as
     /// [`DecisionSource::get_subject_decision`].
-    pub async fn get_subject_decision_with_payload(
+    /// The subject is borrowed and only rendered with [`Display`], so it need not
+    /// be `T` itself or even sized. A caller holding its subject as `str` — for
+    /// instance inside an `Arc<str>` to keep one allocation — can pass it
+    /// directly instead of allocating an owned value per request.
+    pub async fn get_subject_decision_with_payload<S>(
         &self,
-        subject: &T,
+        subject: &S,
     ) -> Result<Option<DecisionResult<String>>, DecisionSourceError>
     where
-        T: Display,
+        S: Display + ?Sized,
     {
         let mut client = self.client.clone();
         let response = client
