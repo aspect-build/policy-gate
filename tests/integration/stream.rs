@@ -12,7 +12,7 @@ use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderValue};
 use http::{HeaderMap, Request, Response};
 use http_body::{Body as _, Frame};
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use policy_gate::{Decision, DecisionSourceError, DecisionSourceErrorKind};
 use tonic::{Code, Status};
 use tower::{Layer, ServiceExt, service_fn};
@@ -137,6 +137,43 @@ async fn wrapped_response_latches_terminal_trailers() {
     assert!(trailers.is_trailers());
     assert!(body.is_end_stream());
     assert!(body.frame().await.is_none(), "nothing follows trailers");
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn wrapped_trailers_only_response_ends_the_stream_before_any_poll() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(source, &ConfigOptions::default()).await;
+    // A gRPC trailers-only response carries its status in the headers and yields
+    // no frames at all. Hyper reads `is_end_stream` before polling to put
+    // END_STREAM on the headers frame; answering `false` costs it that flag and
+    // closes the stream with a trailing empty DATA frame instead, which a gRPC
+    // client rejects as an unexpected EOS.
+    let inner = service_fn(|_request| async {
+        let mut response = Response::new(Empty::<Bytes>::new());
+        Status::new(Code::NotFound, "missing")
+            .add_header(response.headers_mut())
+            .expect("status builds valid gRPC headers");
+        Ok::<_, Infallible>(response)
+    });
+    let mut request = Request::new(axum_core::body::Body::empty());
+    request.extensions_mut().insert(TestSubject(
+        SUBJECT_A.parse().expect("test subject must be a UUID"),
+    ));
+    let mut body = runtime
+        .layer
+        .layer(inner)
+        .oneshot(request)
+        .await
+        .expect("infallible service")
+        .into_body();
+
+    assert!(
+        body.is_end_stream(),
+        "wrapping a trailers-only response must not hide its end of stream"
+    );
+    assert!(body.frame().await.is_none(), "no frames follow");
     runtime.stop().await;
 }
 

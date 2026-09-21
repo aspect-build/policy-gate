@@ -182,7 +182,12 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.ended
+        // Defer to the inner body until this wrapper has ended it. A gRPC
+        // trailers-only response carries `grpc-status` in the headers and yields
+        // no frames, so reporting `false` here costs it END_STREAM on the headers
+        // frame; hyper then closes with an empty DATA frame, which a gRPC client
+        // rejects as an unexpected EOS.
+        self.ended || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
