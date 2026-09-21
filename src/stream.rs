@@ -86,7 +86,11 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
-        if *this.ended {
+        // Matches `is_end_stream`: an inner body that is already finished has
+        // nothing left to enforce, so it must not be handed denial trailers.
+        if *this.ended || this.inner.is_end_stream() {
+            *this.ended = true;
+            *this.readmission = None;
             return Poll::Ready(None);
         }
 
@@ -182,7 +186,12 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.ended
+        // Defer to the inner body until this wrapper has ended it. A gRPC
+        // trailers-only response carries `grpc-status` in the headers and yields
+        // no frames, so reporting `false` here costs it END_STREAM on the headers
+        // frame; hyper then closes with an empty DATA frame, which a gRPC client
+        // rejects as an unexpected EOS.
+        self.ended || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
