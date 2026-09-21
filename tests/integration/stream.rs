@@ -141,6 +141,42 @@ async fn wrapped_response_latches_terminal_trailers() {
 }
 
 #[tokio::test]
+async fn denial_does_not_add_frames_to_an_already_finished_body() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(Arc::clone(&source), &ConfigOptions::default()).await;
+    let inner =
+        service_fn(|_request| async { Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new())) });
+    let mut request = Request::new(axum_core::body::Body::empty());
+    request.extensions_mut().insert(TestSubject(
+        SUBJECT_A.parse().expect("test subject must be a UUID"),
+    ));
+    let mut body = runtime
+        .layer
+        .layer(inner)
+        .oneshot(request)
+        .await
+        .expect("infallible service")
+        .into_body();
+    assert!(body.is_end_stream());
+
+    // A denial landing before the first poll must not resurrect a finished body:
+    // `is_end_stream` already promised the peer there was nothing more to read.
+    watch
+        .send(Ok(change(SUBJECT_A, Decision::Denied)))
+        .expect("watch remains live");
+    wait_for_metric(&runtime.metrics.watch_events, 1).await;
+
+    assert!(body.is_end_stream());
+    assert!(
+        body.frame().await.is_none(),
+        "a finished body must stay finished through a denial"
+    );
+    assert_eq!(runtime.metrics.stream_cutoffs.load(Ordering::Relaxed), 0);
+    runtime.stop().await;
+}
+
+#[tokio::test]
 async fn wrapped_trailers_only_response_ends_the_stream_before_any_poll() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let _watch = source.push_live_watch(Vec::new()).await;

@@ -86,7 +86,11 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
-        if *this.ended {
+        // Matches `is_end_stream`: an inner body that is already finished has
+        // nothing left to enforce, so it must not be handed denial trailers.
+        if *this.ended || this.inner.is_end_stream() {
+            *this.ended = true;
+            *this.readmission = None;
             return Poll::Ready(None);
         }
 
