@@ -154,10 +154,22 @@ where
                                         let gate = this.context.gate.clone();
                                         let subject = (*this.subject).clone();
                                         let delay = gate.admission_timeout();
-                                        *this.readmission = Some(
+                                        let mut replacement =
                                             async move { gate.admit_after(&subject, delay).await }
-                                                .boxed(),
-                                        );
+                                                .boxed();
+                                        // The replacement builds its sleep on first
+                                        // poll, so storing it unpolled would leave
+                                        // the retry with neither a timer nor a
+                                        // waker, and nothing else wakes an idle
+                                        // body -- authority changes deliberately do
+                                        // not. Poll it here so the sleep arms and
+                                        // registers this task; a zero delay resolves
+                                        // at once and is picked up on the next poll.
+                                        let armed = replacement.as_mut().poll(cx).is_pending();
+                                        *this.readmission = Some(replacement);
+                                        if !armed {
+                                            cx.waker().wake_by_ref();
+                                        }
                                     }
                                 }
                             }
