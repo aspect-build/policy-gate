@@ -214,6 +214,76 @@ async fn wrapped_trailers_only_response_ends_the_stream_before_any_poll() {
 }
 
 #[tokio::test]
+async fn idle_body_is_woken_to_retry_after_an_admission_timeout() {
+    let source = Arc::new(ScriptedDecisionSource::default());
+    let _watch = source.push_live_watch(Vec::new()).await;
+    let runtime = start_runtime(
+        Arc::clone(&source),
+        &ConfigOptions {
+            admission_timeout: Duration::from_millis(50),
+            unary_timeout: Duration::from_millis(50),
+            permanent_failure_cooldown: Duration::ZERO,
+            ..ConfigOptions::default()
+        },
+    )
+    .await;
+    let mut call = start_streaming_call(&runtime.layer, SUBJECT_A).await;
+    runtime
+        .gate
+        .admit(&SUBJECT_A.parse().expect("test subject must be a UUID"))
+        .await
+        .expect("subject admits")
+        .invalidate();
+    // Hold the lookup pending across the whole admission deadline so the body
+    // parks on readmission rather than resolving it.
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    source
+        .push_get(
+            SUBJECT_A,
+            GetAction::Gate {
+                release,
+                result: Ok(Decision::Allowed),
+            },
+        )
+        .await;
+
+    let recorder = Arc::new(RecordingWaker::default());
+    let waker = recorder.waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        Pin::new(&mut call.response_body)
+            .poll_frame(&mut cx)
+            .is_pending()
+    );
+    let initial_wakes = recorder.count();
+    runtime.time.advance(Duration::from_millis(50)).await;
+    assert!(
+        recorder.count() > initial_wakes,
+        "the admission deadline wakes its body"
+    );
+
+    // Consume the deadline notification the way an executor would. The poll
+    // installs the replacement retry, which must arrive armed.
+    let before = recorder.count();
+    assert!(
+        Pin::new(&mut call.response_body)
+            .poll_frame(&mut cx)
+            .is_pending()
+    );
+    assert_eq!(
+        runtime.metrics.admission_timeouts.load(Ordering::Relaxed),
+        1
+    );
+    runtime.time.advance(Duration::from_secs(1)).await;
+    let after = recorder.count();
+    runtime.stop().await;
+    assert!(
+        after > before,
+        "the retry must wake the idle body; wake count stayed at {before}"
+    );
+}
+
+#[tokio::test]
 async fn read_is_cut_after_denial_with_trailers_and_metering_stops_at_the_cut() {
     let source = Arc::new(ScriptedDecisionSource::default());
     let watch = source.push_live_watch(Vec::new()).await;
