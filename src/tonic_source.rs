@@ -153,7 +153,7 @@ impl<T> TonicDecisionSource<T> {
     /// The caller must interpret and validate it according to the scope's contract.
     /// `valid_until` is always `None`; the caller owns any deadline calculation.
     /// `DECISION_UNSPECIFIED` returns `Ok(None)`, regardless of the payload.
-    /// The [`DecisionSource`] implementation remains decision-only.
+    /// The [`DecisionSource`] implementation carries no payload.
     ///
     /// # Errors
     ///
@@ -170,22 +170,24 @@ impl<T> TonicDecisionSource<T> {
     where
         S: Display + ?Sized,
     {
+        decode_result(self.fetch(subject).await?, &self.scope, |payload| {
+            (!payload.is_empty()).then(|| Arc::new(payload))
+        })
+    }
+
+    async fn fetch<S>(&self, subject: &S) -> Result<GetSubjectDecisionResponse, DecisionSourceError>
+    where
+        S: Display + ?Sized,
+    {
         let mut client = self.client.clone();
-        let response = client
+        Ok(client
             .get_subject_decision(GetSubjectDecisionRequest {
                 subject_id: subject.to_string(),
                 scope: self.scope.to_string(),
             })
             .await
             .map_err(|status| source_error(&status))?
-            .into_inner();
-        Ok(
-            decode_response(&response, &self.scope)?.map(|decision| DecisionResult {
-                decision,
-                payload: (!response.payload.is_empty()).then(|| Arc::new(response.payload)),
-                valid_until: None,
-            }),
-        )
+            .into_inner())
     }
 
     /// Builds a strict scope-bound client around a host-prepared channel.
@@ -237,16 +239,14 @@ where
         &self,
         subject: &T,
     ) -> Result<Option<Decision>, DecisionSourceError> {
-        let mut client = self.client.clone();
-        let response = client
-            .get_subject_decision(GetSubjectDecisionRequest {
-                subject_id: subject.to_string(),
-                scope: self.scope.to_string(),
-            })
-            .await
-            .map_err(|status| source_error(&status))?
-            .into_inner();
-        decode_response(&response, &self.scope)
+        decode_response(&self.fetch(subject).await?, &self.scope)
+    }
+
+    async fn get_subject_decision_result(
+        &self,
+        subject: &T,
+    ) -> Result<Option<DecisionResult>, DecisionSourceError> {
+        decode_result(self.fetch(subject).await?, &self.scope, |_| None)
     }
 
     async fn watch_subject_decisions(&self) -> Result<Self::Changes, DecisionSourceError> {
@@ -285,10 +285,32 @@ fn decode_change<T: FromStr>(
             "decision source returned an invalid subject identifier",
         )
     })?;
+    let decision = decode_decision(change.decision)?;
     Ok(DecisionChange {
         subject,
-        decision: decode_decision(change.decision)?,
+        decision,
+        denial_reason: decision
+            .and_then(|decision| decode_denial_reason(decision, &change.denial_reason)),
     })
+}
+
+fn decode_result<P>(
+    response: GetSubjectDecisionResponse,
+    scope: &str,
+    payload: impl FnOnce(String) -> Option<Arc<P>>,
+) -> Result<Option<DecisionResult<P>>, DecisionSourceError> {
+    Ok(
+        decode_response(&response, scope)?.map(|decision| DecisionResult {
+            decision,
+            payload: payload(response.payload),
+            valid_until: None,
+            denial_reason: decode_denial_reason(decision, &response.denial_reason),
+        }),
+    )
+}
+
+fn decode_denial_reason(decision: Decision, reason: &str) -> Option<Arc<str>> {
+    (decision == Decision::Denied && !reason.is_empty()).then(|| Arc::from(reason))
 }
 
 fn validate_scope_echo(expected: &str, actual: &str) -> Result<(), DecisionSourceError> {

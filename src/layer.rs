@@ -5,6 +5,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, ready};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,32 +36,66 @@ static NEXT_MISSING_SUBJECT_LOG: AtomicU64 = AtomicU64::new(0);
 /// [`PolicyGateLayer::with_unavailable_response`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyGateLayerConfig {
-    denied_message: Arc<str>,
+    denied_messages: DeniedMessages,
     missing_subject_message: Arc<str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeniedMessages {
+    default: Arc<str>,
+    by_reason: BTreeMap<Arc<str>, Arc<str>>,
+}
+
+impl DeniedMessages {
+    pub(crate) fn for_reason(&self, reason: Option<&str>) -> &str {
+        reason
+            .and_then(|reason| self.by_reason.get(reason))
+            .unwrap_or(&self.default)
+    }
 }
 
 impl PolicyGateLayerConfig {
     /// Creates the layer's rejection text.
     ///
     /// `denied_message` is returned for an authoritative denial, including the mid-stream cutoff
-    /// of an already admitted request. `missing_subject_message` is returned when
-    /// [`RequestPolicy::subject`] finds no subject on the request. Both messages reach clients, so
-    /// keep them free of internal detail.
+    /// of an already admitted request, unless
+    /// [`with_denied_message_for`](Self::with_denied_message_for) maps the denial's reason.
+    /// `missing_subject_message` is returned when [`RequestPolicy::subject`] finds no subject on
+    /// the request. Every message reaches clients, so keep them free of internal detail.
     #[must_use]
     pub fn new(
         denied_message: impl Into<Arc<str>>,
         missing_subject_message: impl Into<Arc<str>>,
     ) -> Self {
         Self {
-            denied_message: denied_message.into(),
+            denied_messages: DeniedMessages {
+                default: denied_message.into(),
+                by_reason: BTreeMap::new(),
+            },
             missing_subject_message: missing_subject_message.into(),
         }
     }
 
-    /// Returns the message rendered for an authoritative denial.
+    /// Renders `message` for a denial whose authority-supplied reason equals `reason`.
+    ///
+    /// A denial with no reason, or with a reason that has no mapping, gets the default
+    /// denied message.
+    #[must_use]
+    pub fn with_denied_message_for(
+        mut self,
+        reason: impl Into<Arc<str>>,
+        message: impl Into<Arc<str>>,
+    ) -> Self {
+        self.denied_messages
+            .by_reason
+            .insert(reason.into(), message.into());
+        self
+    }
+
+    /// Returns the message rendered for an authoritative denial without a mapped reason.
     #[must_use]
     pub fn denied_message(&self) -> &str {
-        &self.denied_message
+        &self.denied_messages.default
     }
 
     /// Returns the message rendered for a request that carries no subject.
@@ -287,7 +322,7 @@ impl core::error::Error for LimitExceededError {}
 /// Shared gate, rejection text, and metrics retained by request/response wrappers.
 pub(crate) struct GateContext<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics + Clone, D> {
     pub(crate) gate: PolicyGate<T, C, M, D>,
-    pub(crate) rejection_message: Arc<str>,
+    pub(crate) denied_messages: DeniedMessages,
     missing_subject_message: Arc<str>,
     pub(crate) metrics: M,
 }
@@ -298,7 +333,7 @@ impl<T: Subject, C: DecisionSource<T>, M: PolicyGateMetrics + Clone, D: TimeDriv
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("GateContext")
             .field("gate", &self.gate)
-            .field("rejection_message", &self.rejection_message)
+            .field("denied_messages", &self.denied_messages)
             .field("missing_subject_message", &self.missing_subject_message)
             .finish_non_exhaustive()
     }
@@ -418,7 +453,7 @@ where
         Self {
             context: Arc::new(GateContext {
                 gate,
-                rejection_message: Arc::clone(&config.denied_message),
+                denied_messages: config.denied_messages.clone(),
                 missing_subject_message: Arc::clone(&config.missing_subject_message),
                 metrics,
             }),
@@ -541,7 +576,7 @@ where
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PolicyGateMiddleware")
-            .field("rejection_message", &self.context.rejection_message)
+            .field("denied_messages", &self.context.denied_messages)
             .finish_non_exhaustive()
     }
 }
@@ -614,6 +649,7 @@ where
                 if admission.state() == AdmissionState::Denied {
                     return Either::Right(Box::pin(ready(Ok(deny(
                         &self.context,
+                        &admission,
                         self.body,
                         self.response,
                     )))));
@@ -646,7 +682,7 @@ where
                         .await;
                     }
                     if admission.state() == AdmissionState::Denied {
-                        return Ok(deny(&context, body, response));
+                        return Ok(deny(&context, &admission, body, response));
                     }
                 }
                 context.metrics.snapshot_miss();
@@ -667,7 +703,7 @@ where
                         .await;
                     }
                     Ok(admission) if admission.state() == AdmissionState::Denied => {
-                        return Ok(deny(&context, body, response));
+                        return Ok(deny(&context, &admission, body, response));
                     }
                     // A concurrent invalidation requires recovery, not a policy rejection.
                     Ok(_) => {}
@@ -837,11 +873,17 @@ fn deny<
     D: TimeDriver,
 >(
     context: &GateContext<T, C, M, D>,
+    admission: &Admission<D>,
     body: A,
     response: R,
 ) -> Response<A::Body> {
     context.metrics.denial();
-    response.denied(body, &context.rejection_message)
+    response.denied(
+        body,
+        context
+            .denied_messages
+            .for_reason(admission.denial_reason().as_deref()),
+    )
 }
 
 fn http_response<A: BodyAdapter>(body: A, status: StatusCode, message: &str) -> Response<A::Body> {

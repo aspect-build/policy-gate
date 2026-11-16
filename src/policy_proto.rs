@@ -37,6 +37,13 @@ pub struct GetSubjectDecisionResponse {
     /// interpret and validate it according to their scope's contract before admitting work.
     #[prost(string, tag = "3")]
     pub payload: ::prost::alloc::string::String,
+    /// Why the subject is denied, as a token whose vocabulary the scope defines.
+    ///
+    /// Valid only with DECISION_DENIED; a client ignores it with any other decision. It is a
+    /// machine-readable token, not display text: clients map it to their own message. The
+    /// authority MUST leave it empty when it gives no reason.
+    #[prost(string, tag = "4")]
+    pub denial_reason: ::prost::alloc::string::String,
 }
 /// Opens one scope's change stream.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -70,6 +77,13 @@ pub struct SubjectDecisionChange {
     /// reconnects.
     #[prost(string, tag = "3")]
     pub scope: ::prost::alloc::string::String,
+    /// Why the subject is now denied, under the same rules as
+    /// GetSubjectDecisionResponse.denial_reason.
+    ///
+    /// A change replaces the subject's cached reason, so an authority sends a change when only
+    /// the reason differs.
+    #[prost(string, tag = "4")]
+    pub denial_reason: ::prost::alloc::string::String,
 }
 /// Whether a subject may work within a scope.
 ///

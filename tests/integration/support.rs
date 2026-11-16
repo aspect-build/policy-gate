@@ -16,7 +16,7 @@ use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::Full;
 use policy_gate::{
-    AxumBodyAdapter, Decision, DecisionChange, DecisionSource, DecisionSourceError,
+    AxumBodyAdapter, Decision, DecisionChange, DecisionResult, DecisionSource, DecisionSourceError,
     DecisionSourceHealth, DecisionSourceHealthStatus, PolicyGate, PolicyGateConfig,
     PolicyGateLayer, PolicyGateLayerConfig, PolicyGateMetrics, RequestPolicy, TimeDriver,
     TonicRejectionResponse,
@@ -32,6 +32,8 @@ mod time;
 pub(crate) use time::TestTimeDriver;
 
 pub(crate) const PAYMENT_URL: &str = "https://pay.example.test/billing";
+pub(crate) const DENIAL_REASON: &str = "dedicated-deployment";
+pub(crate) const DENIAL_REASON_MESSAGE: &str = "This organization uses a dedicated deployment.";
 pub(crate) const SUBJECT_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 pub(crate) const SUBJECT_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 pub(crate) const SUBJECT_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
@@ -193,6 +195,15 @@ fn test_metrics() -> TestMetrics {
     TestMetrics(Box::leak(Box::new(TestMetricStorage::default())))
 }
 
+fn decision_result(decision: Decision, denial_reason: Option<&str>) -> DecisionResult {
+    DecisionResult {
+        decision,
+        payload: None,
+        valid_until: None,
+        denial_reason: denial_reason.map(Arc::from),
+    }
+}
+
 type ScriptedChange = Result<DecisionChange<Uuid>, DecisionSourceError>;
 type ScriptedChangeStream = stream::Chain<
     stream::Iter<std::vec::IntoIter<ScriptedChange>>,
@@ -201,6 +212,7 @@ type ScriptedChangeStream = stream::Chain<
 
 pub(crate) enum GetAction {
     Return(Result<Decision, DecisionSourceError>),
+    DeniedFor(&'static str),
     Gate {
         release: Arc<Semaphore>,
         result: Result<Decision, DecisionSourceError>,
@@ -308,6 +320,15 @@ impl DecisionSource<Uuid> for ScriptedDecisionSource {
         &self,
         subject: &Uuid,
     ) -> Result<Option<Decision>, DecisionSourceError> {
+        self.get_subject_decision_result(subject)
+            .await
+            .map(|result| result.map(|result| result.decision))
+    }
+
+    async fn get_subject_decision_result(
+        &self,
+        subject: &Uuid,
+    ) -> Result<Option<DecisionResult>, DecisionSourceError> {
         let subject = subject.to_string();
         self.get_calls.fetch_add(1, Ordering::AcqRel);
         let action = self
@@ -318,13 +339,18 @@ impl DecisionSource<Uuid> for ScriptedDecisionSource {
             .and_then(VecDeque::pop_front)
             .unwrap_or(GetAction::Return(Ok(Decision::Allowed)));
         let result = match action {
-            GetAction::Return(result) => result.map(Some),
+            GetAction::Return(result) => {
+                result.map(|decision| Some(decision_result(decision, None)))
+            }
             GetAction::Gate { release, result } => {
                 let admission = release.acquire().await.expect("gate must remain open");
                 admission.forget();
-                result.map(Some)
+                result.map(|decision| Some(decision_result(decision, None)))
             }
             GetAction::Missing => Ok(None),
+            GetAction::DeniedFor(reason) => {
+                Ok(Some(decision_result(Decision::Denied, Some(reason))))
+            }
         };
         self.get_completions.fetch_add(1, Ordering::Release);
         result
@@ -411,6 +437,7 @@ pub(crate) fn layer_config() -> PolicyGateLayerConfig {
         ),
         "request is missing the subject identifier required for policy enforcement",
     )
+    .with_denied_message_for(DENIAL_REASON, DENIAL_REASON_MESSAGE)
 }
 
 pub(crate) struct TestRuntime {
@@ -524,6 +551,14 @@ pub(crate) fn change(subject: &str, state: Decision) -> DecisionChange<Uuid> {
     DecisionChange {
         subject: subject.parse().expect("test subject must be a UUID"),
         decision: Some(state),
+        denial_reason: None,
+    }
+}
+
+pub(crate) fn denied_for(subject: &str, reason: &str) -> DecisionChange<Uuid> {
+    DecisionChange {
+        denial_reason: Some(Arc::from(reason)),
+        ..change(subject, Decision::Denied)
     }
 }
 
@@ -531,6 +566,7 @@ pub(crate) fn withdrawal(subject: &str) -> DecisionChange<Uuid> {
     DecisionChange {
         subject: subject.parse().expect("test subject must be a UUID"),
         decision: None,
+        denial_reason: None,
     }
 }
 

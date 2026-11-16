@@ -3,6 +3,7 @@
 mod admission;
 mod cancellation;
 mod config;
+mod denial_reason;
 mod eviction;
 mod freshness;
 mod proto_contract;

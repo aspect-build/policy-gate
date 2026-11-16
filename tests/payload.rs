@@ -70,6 +70,7 @@ fn allowed(value: &'static str) -> DecisionResult<Payload> {
         decision: Decision::Allowed,
         payload: Some(Arc::new(Payload(value))),
         valid_until: None,
+        denial_reason: None,
     }
 }
 
@@ -95,6 +96,7 @@ async fn watch_and_invalidation_clear_the_published_payload() {
         .send(Ok(DecisionChange {
             subject: 1,
             decision: Some(Decision::Allowed),
+            denial_reason: None,
         }))
         .unwrap();
     assert!(poll!(&mut watcher).is_pending());
