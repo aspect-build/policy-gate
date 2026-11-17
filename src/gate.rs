@@ -79,6 +79,7 @@ pub trait DecisionSource<T: Subject, P = ()>: Send + Sync + 'static {
                     decision,
                     payload: None,
                     valid_until: None,
+                    denial_reason: None,
                 })
             })
         }
@@ -175,7 +176,7 @@ impl<D: TimeDriver, P> Admission<D, P> {
         if expired {
             return (AdmissionState::Stale, false);
         }
-        let state = match decode_entry_state(current.0) {
+        let state = match decode_entry_state(current.word) {
             EntryState::Allowed => AdmissionState::Allowed,
             EntryState::Denied => AdmissionState::Denied,
             EntryState::Stale => AdmissionState::Stale,
@@ -195,8 +196,17 @@ impl<D: TimeDriver, P> Admission<D, P> {
     #[must_use]
     pub fn payload(&self) -> Option<Arc<P>> {
         let (current, expired) = self.entry.current_at(D::now());
-        (!expired && decode_entry_state(current.0) == EntryState::Allowed)
-            .then(|| current.1.clone())
+        (!expired && decode_entry_state(current.word) == EntryState::Allowed)
+            .then(|| current.payload.clone())
+            .flatten()
+    }
+
+    /// Returns the authority's reason for a current, unexpired denial.
+    #[must_use]
+    pub fn denial_reason(&self) -> Option<Arc<str>> {
+        let (current, expired) = self.entry.current_at(D::now());
+        (!expired && decode_entry_state(current.word) == EntryState::Denied)
+            .then(|| current.denial_reason.clone())
             .flatten()
     }
 
@@ -493,7 +503,6 @@ impl<P> Drop for PendingEnqueueGuard<'_, P> {
 // causing false sharing on 64- or 128-byte cache lines.
 #[repr(align(128))]
 pub(crate) struct Entry<P> {
-    // Low two bits encode state; the upper bits encode nanoseconds since `epoch`.
     current: ArcSwap<EntrySnapshot<P>>,
     epoch: Instant,
     pending: ArcSwapOption<PendingFetch>,
@@ -501,8 +510,25 @@ pub(crate) struct Entry<P> {
     refresh_not_before: AtomicU64,
 }
 
-// Encoded state/deadline, payload, and earliest refresh tick publish together.
-struct EntrySnapshot<P>(u64, Option<Arc<P>>, u64);
+// Fields publish together so a reader never pairs a decision with another decision's detail.
+struct EntrySnapshot<P> {
+    // Low two bits encode state; the upper bits encode nanoseconds since the entry's `epoch`.
+    word: u64,
+    payload: Option<Arc<P>>,
+    refresh_after: u64,
+    denial_reason: Option<Arc<str>>,
+}
+
+impl<P> EntrySnapshot<P> {
+    const fn without_detail(word: u64) -> Self {
+        Self {
+            word,
+            payload: None,
+            refresh_after: 0,
+            denial_reason: None,
+        }
+    }
+}
 
 const _: () = assert!(core::mem::size_of::<Entry<()>>() == 128);
 #[cfg(target_pointer_width = "64")]
@@ -511,7 +537,7 @@ const _: () = assert!(core::mem::size_of::<Admission<TokioTimeDriver>>() == 8);
 impl<P> core::fmt::Debug for Entry<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Entry")
-            .field("state", &decode_entry_state(self.current.load().0))
+            .field("state", &decode_entry_state(self.current.load().word))
             .finish_non_exhaustive()
     }
 }
@@ -523,11 +549,10 @@ const MAX_FINITE_DEADLINE: u64 = NO_EXPIRY - 1;
 impl<P> Entry<P> {
     fn pending(epoch: Instant, fetch: Arc<PendingFetch>, refresh_before: Duration) -> Self {
         Self {
-            current: ArcSwap::from_pointee(EntrySnapshot(
-                Self::word(EntryState::Pending, NO_EXPIRY),
-                None,
-                0,
-            )),
+            current: ArcSwap::from_pointee(EntrySnapshot::without_detail(Self::word(
+                EntryState::Pending,
+                NO_EXPIRY,
+            ))),
             epoch,
             pending: ArcSwapOption::from(Some(fetch)),
             refresh_before: u64::try_from(refresh_before.as_nanos()).unwrap_or(u64::MAX),
@@ -540,7 +565,7 @@ impl<P> Entry<P> {
         if expired {
             EntryState::Stale
         } else {
-            decode_entry_state(decision.0)
+            decode_entry_state(decision.word)
         }
     }
 
@@ -549,7 +574,7 @@ impl<P> Entry<P> {
         if expired {
             return Observed::Expired;
         }
-        match decode_entry_state(decision.0) {
+        match decode_entry_state(decision.word) {
             EntryState::Pending => {
                 unreachable!("an admission is created only from an authoritative state")
             }
@@ -564,7 +589,7 @@ impl<P> Entry<P> {
         if expired {
             return None;
         }
-        match decode_entry_state(decision.0) {
+        match decode_entry_state(decision.word) {
             EntryState::Allowed => Some(Decision::Allowed),
             EntryState::Denied => Some(Decision::Denied),
             EntryState::Pending | EntryState::Stale => None,
@@ -578,7 +603,7 @@ impl<P> Entry<P> {
     ) -> Result<(), EntryState> {
         let mut previous = self.current.load_full();
         loop {
-            let previous_state = decode_entry_state(previous.0);
+            let previous_state = decode_entry_state(previous.word);
             if previous_state != current {
                 return Err(previous_state);
             }
@@ -624,10 +649,10 @@ impl<P> Entry<P> {
     }
 
     fn refresh_eligible_at(&self, current: &EntrySnapshot<P>, now: Instant) -> bool {
-        let deadline = current.0 >> 2;
+        let deadline = current.word >> 2;
         if deadline == NO_EXPIRY
             || !matches!(
-                decode_entry_state(current.0),
+                decode_entry_state(current.word),
                 EntryState::Allowed | EntryState::Denied
             )
         {
@@ -635,7 +660,7 @@ impl<P> Entry<P> {
         }
         let now = self.tick(now);
         now < deadline
-            && now >= current.2
+            && now >= current.refresh_after
             && deadline - now <= self.refresh_before
             && now >= self.refresh_not_before.load(Ordering::Relaxed)
     }
@@ -643,15 +668,15 @@ impl<P> Entry<P> {
     fn current_at(&self, now: Instant) -> (Arc<EntrySnapshot<P>>, bool) {
         let mut current = self.current.load_full();
         loop {
-            if !self.is_expired_at(current.0, now) {
+            if !self.is_expired_at(current.word, now) {
                 return (current, false);
             }
             // A refresh CAS cannot revive the word after any observer has seen it expire.
-            let stale = (current.0 & !STATE_MASK) | EntryState::Stale as u64;
-            if current.0 == stale {
+            let stale = (current.word & !STATE_MASK) | EntryState::Stale as u64;
+            if current.word == stale {
                 return (current, true);
             }
-            let next = Arc::new(EntrySnapshot(stale, None, 0));
+            let next = Arc::new(EntrySnapshot::without_detail(stale));
             let changed = self.current.compare_and_swap(&current, Arc::clone(&next));
             if Arc::ptr_eq(&changed, &current) {
                 return (next, true);
@@ -709,10 +734,8 @@ impl<P> Entry<P> {
         loop {
             let changed = self.current.compare_and_swap(
                 &previous,
-                Arc::new(EntrySnapshot(
-                    (previous.0 & !STATE_MASK) | EntryState::Stale as u64,
-                    None,
-                    0,
+                Arc::new(EntrySnapshot::without_detail(
+                    (previous.word & !STATE_MASK) | EntryState::Stale as u64,
                 )),
             );
             if Arc::ptr_eq(&changed, &previous) {
@@ -1000,15 +1023,20 @@ impl<
         } else {
             0
         };
-        Arc::new(EntrySnapshot(
-            Entry::<P>::word(result.decision.into(), deadline),
-            result
+        Arc::new(EntrySnapshot {
+            word: Entry::<P>::word(result.decision.into(), deadline),
+            payload: result
                 .payload
                 .as_ref()
                 .filter(|_| result.decision == Decision::Allowed)
                 .cloned(),
             refresh_after,
-        ))
+            denial_reason: result
+                .denial_reason
+                .as_ref()
+                .filter(|reason| result.decision == Decision::Denied && !reason.is_empty())
+                .cloned(),
+        })
     }
 
     /// Reads subject state through the snapshot and records its map recency.
@@ -1303,7 +1331,7 @@ impl<
         let result = result.map(|result| self.decision_snapshot(entry, &result));
         let now = D::now();
         let result = result.and_then(|snapshot| {
-            if entry.is_expired_at(snapshot.0, now) {
+            if entry.is_expired_at(snapshot.word, now) {
                 Err(DecisionSourceError::new(
                     DecisionSourceErrorKind::Transient,
                     "decision expired before publication",
@@ -1314,7 +1342,7 @@ impl<
         });
         if let Some(current) = refresh_from {
             if let Ok(snapshot) = &result {
-                if !entry.is_expired_at(current.0, now) {
+                if !entry.is_expired_at(current.word, now) {
                     entry
                         .current
                         .compare_and_swap(current, Arc::clone(snapshot));
@@ -1363,11 +1391,10 @@ impl<
             entry
                 .compare_exchange(
                     EntryState::Pending,
-                    &Arc::new(EntrySnapshot(
-                        Entry::<P>::word(EntryState::Stale, NO_EXPIRY),
-                        None,
-                        0,
-                    )),
+                    &Arc::new(EntrySnapshot::without_detail(Entry::<P>::word(
+                        EntryState::Stale,
+                        NO_EXPIRY,
+                    ))),
                 )
                 .is_ok()
         });
@@ -1477,7 +1504,7 @@ impl<
         if let Some(decision) = change.decision {
             self.subjects.update(subject, D::now(), |entry| {
                 loop {
-                    match decode_entry_state(entry.current.load().0) {
+                    match decode_entry_state(entry.current.load().word) {
                         current @ (EntryState::Pending
                         | EntryState::Allowed
                         | EntryState::Denied
@@ -1489,6 +1516,7 @@ impl<
                                     decision,
                                     payload: None,
                                     valid_until: None,
+                                    denial_reason: change.denial_reason.clone(),
                                 },
                             ),
                         ) {

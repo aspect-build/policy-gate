@@ -265,6 +265,9 @@ pub struct DecisionResult<P = ()> {
     /// Successful results that land inside the refresh window wait half their remaining
     /// effective lifetime before becoming eligible for refresh.
     pub valid_until: Option<Instant>,
+    /// Scope-defined token explaining a [`Decision::Denied`] result; ignored with any other
+    /// decision.
+    pub denial_reason: Option<Arc<str>>,
 }
 
 /// One normalized authoritative subject-state update.
@@ -276,6 +279,9 @@ pub struct DecisionChange<T> {
     ///
     /// Withdrawal drops the subject from the cache and marks its admission handles stale.
     pub decision: Option<Decision>,
+    /// Scope-defined token explaining a [`Decision::Denied`] change; ignored with any other
+    /// decision. It replaces the subject's cached reason.
+    pub denial_reason: Option<Arc<str>>,
 }
 
 /// How the runtime should handle a decision-source failure.

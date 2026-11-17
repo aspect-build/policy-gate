@@ -21,6 +21,7 @@ static WATCHER: Mutex<Option<DecisionWatcher>> = Mutex::new(None);
 struct CancellationTime;
 
 impl TimeDriver for CancellationTime {
+    #[allow(deprecated)]
     fn now() -> Instant {
         if NOW_CALLS_UNTIL_CANCEL.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
             remaining.checked_sub(1)

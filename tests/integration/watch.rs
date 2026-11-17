@@ -40,6 +40,7 @@ impl Stream for AlwaysReadyChanges {
         Poll::Ready(Some(Ok(DecisionChange {
             subject: self.subject,
             decision: Some(Decision::Denied),
+            denial_reason: None,
         })))
     }
 }

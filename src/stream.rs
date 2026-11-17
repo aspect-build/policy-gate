@@ -94,7 +94,7 @@ where
             return Poll::Ready(None);
         }
 
-        loop {
+        let reason = loop {
             // Recheck on every body poll. No change observer wakes an idle connection.
             match this.admission.observe() {
                 Observed::Allowed => {
@@ -105,7 +105,7 @@ where
                         this.readmission,
                     );
                 }
-                Observed::Denied | Observed::Expired => break,
+                Observed::Denied | Observed::Expired => break this.admission.denial_reason(),
                 Observed::Stale => {
                     if let Some(admission) =
                         this.context.gate.state.check_without_refresh(this.subject)
@@ -125,7 +125,7 @@ where
                             }
                         } else if admission.state() == AdmissionState::Denied {
                             *this.readmission = None;
-                            break;
+                            break admission.denial_reason();
                         }
                     }
                     if this.readmission.is_none() {
@@ -147,7 +147,7 @@ where
                                     Ok(admission)
                                         if admission.state() == AdmissionState::Denied =>
                                     {
-                                        break;
+                                        break admission.denial_reason();
                                     }
                                     Ok(_) => continue,
                                     Err(_) => {
@@ -183,15 +183,15 @@ where
                     );
                 }
             }
-        }
+        };
 
         *this.ended = true;
         *this.readmission = None;
         this.context.metrics.stream_cutoff();
-        match this
-            .response
-            .stream_denied(*this.side, &this.context.rejection_message)
-        {
+        match this.response.stream_denied(
+            *this.side,
+            this.context.denied_messages.for_reason(reason.as_deref()),
+        ) {
             StreamRejection::Trailers(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
             StreamRejection::Error(error) => Poll::Ready(Some(Err(error))),
         }

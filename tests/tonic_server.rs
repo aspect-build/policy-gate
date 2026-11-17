@@ -13,6 +13,7 @@ use policy_gate::policy_proto::{
 use tonic::{Request, Response, Status};
 
 const OPAQUE_PAYLOAD: &str = "not JSON: \0\r\n café 🐄 ";
+const DENIAL_REASON: &str = "dedicated-deployment";
 
 struct StubAuthority(&'static str);
 
@@ -39,6 +40,11 @@ impl PolicyAuthority for StubAuthority {
             } else {
                 OPAQUE_PAYLOAD.into()
             },
+            denial_reason: if decision == 2 {
+                DENIAL_REASON.into()
+            } else {
+                String::new()
+            },
         }))
     }
 
@@ -49,13 +55,20 @@ impl PolicyAuthority for StubAuthority {
         &self,
         _request: Request<WatchSubjectDecisionsRequest>,
     ) -> Result<Response<Self::WatchSubjectDecisionsStream>, Status> {
-        Ok(Response::new(Box::pin(tokio_stream::iter([Ok(
-            SubjectDecisionChange {
+        Ok(Response::new(Box::pin(tokio_stream::iter([
+            Ok(SubjectDecisionChange {
                 subject_id: "tenant".into(),
                 decision: 1,
                 scope: self.0.into(),
-            },
-        )]))))
+                denial_reason: String::new(),
+            }),
+            Ok(SubjectDecisionChange {
+                subject_id: "tenant".into(),
+                decision: 2,
+                scope: self.0.into(),
+                denial_reason: DENIAL_REASON.into(),
+            }),
+        ]))))
     }
 }
 
@@ -67,7 +80,7 @@ fn public_bindings_construct_a_policy_authority_server() {
 #[cfg(feature = "tonic-client")]
 #[tokio::test]
 async fn unary_and_watch_require_exact_scope_echoes() -> Result<(), Box<dyn std::error::Error>> {
-    use policy_gate::{DecisionSource, DecisionSourceErrorKind, TonicDecisionSource};
+    use policy_gate::{Decision, DecisionSource, DecisionSourceErrorKind, TonicDecisionSource};
     use tokio_stream::StreamExt;
 
     for echo in ["cache", "", "bes"] {
@@ -89,16 +102,17 @@ async fn unary_and_watch_require_exact_scope_echoes() -> Result<(), Box<dyn std:
         let with_payload = source
             .get_subject_decision_with_payload(&"opaque".to_owned())
             .await;
-        let change = source
-            .watch_subject_decisions()
-            .await?
-            .next()
-            .await
-            .ok_or("watch closed")?;
+        let mut changes = source.watch_subject_decisions().await?;
+        let change = changes.next().await.ok_or("watch closed")?;
         if echo == "cache" {
             assert!(unary.is_ok());
             assert!(with_payload.is_ok());
-            assert!(change.is_ok());
+            let allowed = change?;
+            assert_eq!(allowed.decision, Some(Decision::Allowed));
+            assert!(allowed.denial_reason.is_none());
+            let denied = changes.next().await.ok_or("watch closed")??;
+            assert_eq!(denied.decision, Some(Decision::Denied));
+            assert_eq!(denied.denial_reason.as_deref(), Some(DENIAL_REASON));
         } else {
             assert_eq!(unary.unwrap_err().kind(), DecisionSourceErrorKind::Wire);
             assert_eq!(
@@ -162,6 +176,9 @@ async fn raw_payload_is_opt_in_and_preserves_unary_validation()
         assert_eq!(unit.decision, decision);
         assert!(unit.payload.is_none());
         assert!(unit.valid_until.is_none());
+        let reason = (decision == Decision::Denied).then_some(DENIAL_REASON);
+        assert_eq!(result.denial_reason.as_deref(), reason);
+        assert_eq!(unit.denial_reason.as_deref(), reason);
     }
     let subject = "unspecified".to_owned();
     assert!(
@@ -216,7 +233,7 @@ fn payload_is_wire_compatible_with_the_old_response_schema() {
         scope: "cache".into(),
     };
     let mut new = GetSubjectDecisionResponse::decode(old.encode_to_vec().as_slice()).unwrap();
-    assert!(new.payload.is_empty());
+    assert_eq!(new.payload, "");
     assert_eq!(new.encode_to_vec(), old.encode_to_vec());
     new.payload = OPAQUE_PAYLOAD.into();
     let encoded = new.encode_to_vec();
