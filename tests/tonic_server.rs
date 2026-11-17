@@ -233,7 +233,7 @@ fn payload_is_wire_compatible_with_the_old_response_schema() {
         scope: "cache".into(),
     };
     let mut new = GetSubjectDecisionResponse::decode(old.encode_to_vec().as_slice()).unwrap();
-    assert!(new.payload.is_empty());
+    assert_eq!(new.payload, "");
     assert_eq!(new.encode_to_vec(), old.encode_to_vec());
     new.payload = OPAQUE_PAYLOAD.into();
     let encoded = new.encode_to_vec();

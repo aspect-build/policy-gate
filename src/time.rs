@@ -18,15 +18,15 @@ pub trait TimeDriver: Clone + Send + Sync + Sized + 'static {
     fn now() -> Instant;
 
     /// Waits until `deadline` according to the same clock returned by [`TimeDriver::now`].
-    #[must_use]
+    #[must_use = "futures do nothing unless awaited"]
     fn sleep_until(deadline: Instant) -> impl Future<Output = ()> + Send;
 
     /// Yields execution back to the asynchronous runtime once.
-    #[must_use]
+    #[must_use = "futures do nothing unless awaited"]
     fn yield_now() -> impl Future<Output = ()> + Send;
 
     /// Waits for `duration` according to this driver.
-    #[must_use]
+    #[must_use = "futures do nothing unless awaited"]
     fn sleep(duration: Duration) -> impl Future<Output = ()> + Send {
         let deadline = Self::now().checked_add(duration);
         async move {
@@ -38,7 +38,7 @@ pub trait TimeDriver: Clone + Send + Sync + Sized + 'static {
     }
 
     /// Runs `future` until it completes or `duration` elapses.
-    #[must_use]
+    #[must_use = "futures do nothing unless awaited"]
     fn timeout<F>(
         duration: Duration,
         future: F,
@@ -59,7 +59,7 @@ pub trait TimeDriver: Clone + Send + Sync + Sized + 'static {
     ///
     /// The timeout wins if both futures become ready in the same poll. The losing future is
     /// dropped before this method returns.
-    #[must_use]
+    #[must_use = "futures do nothing unless awaited"]
     fn timeout_at<F>(
         deadline: Instant,
         future: F,
